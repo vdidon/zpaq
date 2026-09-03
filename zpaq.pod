@@ -556,6 +556,14 @@ With C<add>, do not save Windows attributes or Unix/Linux permissions
 to the archive. With C<extract>, ignore the saved values and extract using
 default values. With C<list>, do not list or compare attributes.
 
+=item -noads
+
+With C<add> and C<list> in Windows, do not look for alternate data
+streams. Finding them requires opening every file, which takes most
+of the time to scan a large tree of small files that has not changed.
+Streams saved by an earlier C<add> without this option are marked as
+deleted in the new version.
+
 =item -not [I<file>]...
 
 =item -not =[#+-?^]...

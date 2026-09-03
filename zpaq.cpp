@@ -1072,6 +1072,7 @@ private:
   const char* password;     // points to password_string or NULL
   string method;            // default "1"
   bool noattributes;        // -noattributes option
+  bool noads;               // -noads option (Windows)
   vector<string> notfiles;  // list of prefixes to exclude
   string nottype;           // -not =...
   vector<string> onlyfiles; // list of prefixes to include
@@ -1136,6 +1137,7 @@ void Jidac::usage() {
 "  -key X          Create or access encrypted archive with password X.\n"
 "  -mN  -method N  Compress level N (0..5 = faster..better, default 1).\n"
 "  -noattributes   Ignore/don't save file attributes or permissions.\n"
+"  -noads          Don't save alternate data streams (Windows).\n"
 "  -not files...   Exclude. * and ? match any string or char.\n"
 "       =[+-#^?]   List: exclude by comparison result.\n"
 "  -only files...  Include only matches (default: *).\n"
@@ -1217,6 +1219,7 @@ int Jidac::doCommand(int argc, const char** argv) {
   index=0;
   method="";  // 0..5
   noattributes=false;
+  noads=false;
   repack=0;
   new_password=0;
   summary=0; // detailed: -1
@@ -1272,6 +1275,7 @@ int Jidac::doCommand(int argc, const char** argv) {
     else if (opt=="-method" && i<argc-1) method=argv[++i];
     else if (opt[1]=='m') method=argv[i]+2;
     else if (opt=="-noattributes") noattributes=true;
+    else if (opt=="-noads") noads=true;
     else if (opt=="-not") {  // read notfiles
       while (++i<argc && argv[i][0]!='-') {
         if (argv[i][0]=='=') nottype=argv[i];
@@ -1909,7 +1913,7 @@ void Jidac::scandir(string filename) {
 
       // Queue the file for alternate stream enumeration (Win2003/Vista
       // or later), done in parallel by scanstreams()
-      else if (findFirstStreamW && findNextStreamW) {
+      else if (!noads && findFirstStreamW && findNextStreamW) {
         StreamScan s;
         s.fn=fn;
         s.edate=edate;
