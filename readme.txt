@@ -77,6 +77,9 @@ Options have the following meanings:
            in libzpaq. It is otherwise compiled in with g++ 5 or later,
            clang or Visual Studio 2017 or later, and used only if the
            CPU supports it (detected at run time).
+-DNOAESNI = turn off AES hardware acceleration (x86 AES-NI) used for
+           -key encryption in libzpaq. Same compilers and run time
+           detection as -DNOSHANI.
 -pthread = link to pthread library (required in unix/Linux).
 
 General options:
