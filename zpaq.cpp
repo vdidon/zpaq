@@ -472,17 +472,22 @@ bool delete_file(const char* filename) {
 
 #ifdef unix
 
+// Print error message err (errno)
+void printerr(const char* filename, int err) {
+  fflush(stdout);
+  fprintf(stderr, "%s: %s\n", filename, strerror(err));
+}
+
 // Print last error message
 void printerr(const char* filename) {
-  perror(filename);
+  printerr(filename, errno);
 }
 
 #else
 
-// Print last error message
-void printerr(const char* filename) {
+// Print error message err (GetLastError())
+void printerr(const char* filename, int err) {
   fflush(stdout);
-  int err=GetLastError();
   printUTF8(filename, stderr);
   if (err==ERROR_FILE_NOT_FOUND)
     fprintf(stderr, ": file not found\n");
@@ -500,6 +505,11 @@ void printerr(const char* filename) {
     fprintf(stderr, ": network name no longer available\n");
   else
     fprintf(stderr, ": Windows error %d\n", err);
+}
+
+// Print last error message
+void printerr(const char* filename) {
+  printerr(filename, GetLastError());
 }
 
 #endif
@@ -2233,6 +2243,204 @@ struct WriterPair: public libzpaq::Writer {
 };
 
 // Add or delete files from archive. Return 1 if error else 0.
+// A ReadJob reads, splits into fragments and hashes a fixed list of files
+// in a background thread. add() consumes the fragments in file order from
+// several such queues, so that the latency of opening and reading each
+// file overlaps with the work of the other threads. A queue holds at most
+// about quota bytes of fragments not yet consumed (plus one fragment).
+
+// One fragment, followed in memory by sz bytes of data
+struct Frag {
+  Frag* next;             // next in queue
+  unsigned sz;            // data size
+  unsigned hits;          // correct order-1 predictions while scanning
+  int err;                // open error code if failed
+  bool failed;            // file could not be opened (no data)
+  bool last;              // last fragment of the file
+  char sha1[20];          // hash of data
+  unsigned char o1[256];  // order-1 context -> predicted byte at the end
+  char* data() {return (char*)(this+1);}
+  static Frag* alloc(unsigned sz) {
+    Frag* f=(Frag*)malloc(sizeof(Frag)+sz);
+    if (!f) throw std::bad_alloc();
+    f->next=0;
+    f->sz=sz;
+    f->hits=0;
+    f->err=0;
+    f->failed=false;
+    f->last=false;
+    return f;
+  }
+};
+
+class ReadJob {
+  Mutex mutex;         // protects the fields below
+  Semaphore avail;     // signaled when the main thread waits for data
+  Semaphore space;     // signaled when the reader waits for room
+  bool mwait, rwait;   // main or reader thread is waiting
+  Frag* head;          // queue of fragments, in file order
+  Frag* tail;
+  int64_t used;        // bytes in queue, including overhead
+  int64_t quota;       // wait when used reaches quota
+public:
+  const vector<DTMap::iterator>* vf;  // all files being added
+  vector<unsigned> files;  // indexes in vf of the files to read, increasing
+  unsigned maxfrag, minfrag, hmin;  // fragmentation parameters
+  ReadJob(): mwait(false), rwait(false), head(0), tail(0), used(0), quota(0),
+      vf(0), maxfrag(0), minfrag(0), hmin(0) {
+    init_mutex(mutex);
+    avail.init(0);
+    space.init(0);
+  }
+  ~ReadJob() {
+    while (head) {
+      Frag* f=head;
+      head=f->next;
+      free(f);
+    }
+    space.destroy();
+    avail.destroy();
+    destroy_mutex(mutex);
+  }
+  void setQuota(int64_t q) {quota=q;}
+
+  // Reader thread: append f, then wait while the queue is over quota
+  void push(Frag* f) {
+    lock(mutex);
+    f->next=0;
+    if (tail) tail->next=f;
+    else head=f;
+    tail=f;
+    used+=sizeof(Frag)+f->sz;
+    if (mwait) {
+      mwait=false;
+      avail.signal();
+    }
+    while (used>=quota) {
+      rwait=true;
+      release(mutex);
+      space.wait();
+      lock(mutex);
+    }
+    release(mutex);
+  }
+
+  // Main thread: remove and return the first fragment, waiting if needed.
+  // The reader is woken up once the queue is half empty.
+  Frag* pop() {
+    lock(mutex);
+    while (!head) {
+      mwait=true;
+      release(mutex);
+      avail.wait();
+      lock(mutex);
+    }
+    Frag* f=head;
+    head=f->next;
+    if (!head) tail=0;
+    used-=sizeof(Frag)+f->sz;
+    if (rwait && used<quota/2) {
+      rwait=false;
+      space.signal();
+    }
+    release(mutex);
+    return f;
+  }
+};
+
+// Read the files of a ReadJob and queue their fragments
+ThreadReturn readThread(void* arg) {
+  ReadJob& job=*(ReadJob*)arg;
+  try {
+    const int BUFSIZE=1<<18;
+    libzpaq::Array<char> buf(BUFSIZE);
+    libzpaq::Array<char> fragbuf(job.maxfrag);
+    for (unsigned k=0; k<job.files.size(); ++k) {
+      DTMap::iterator p=(*job.vf)[job.files[k]];
+      FP in=fopen(p->first.c_str(), RB);
+      if (in==FPNULL) {
+        Frag* f=Frag::alloc(0);
+#ifdef unix
+        f->err=errno;
+#else
+        f->err=GetLastError();
+#endif
+        f->failed=true;
+        f->last=true;
+        job.push(f);
+        continue;
+      }
+      int bufptr=0, buflen=0;  // read pointer and limit
+      bool eof=false;  // a short read was seen: nothing more to read
+      while (true) {  // for each fragment
+        unsigned sz=0;  // fragment size
+        unsigned hits=0;  // correct prediction count
+        int c=EOF;  // current byte
+        int c1=0;  // previous byte
+        unsigned h=0;  // rolling hash for finding fragment boundaries
+        unsigned char o1[256]={0};  // order 1 context -> predicted byte
+        while (true) {
+          if (bufptr>=buflen && !eof) {
+            bufptr=0, buflen=fread(&buf[0], 1, BUFSIZE, in);
+            eof=buflen<BUFSIZE;  // short read: end of a regular file,
+          }                      // saves a system call per file
+          if (bufptr>=buflen) {
+            c=EOF;
+            break;
+          }
+
+          // Scan buf[bufptr..buflen-1] until a fragment boundary
+          const unsigned char* const base=(const unsigned char*)&buf[0];
+          const unsigned char* q=base+bufptr;
+          const unsigned char* qend=base+buflen;
+          const int64_t room=int64_t(job.maxfrag)-sz;
+          assert(room>0);
+          if (qend-q>room) qend=q+room;
+          bool boundary=false;
+          while (q<qend) {
+            c=*q++;
+            // The prediction test is unpredictable, so select the
+            // multiplier arithmetically (314159265 if hit, else 271828182)
+            const unsigned hit=(c==o1[c1]);
+            h=(h+c+1)*(271828182u+hit*42331083u);
+            hits+=hit;
+            o1[c1]=c;
+            c1=c;
+            fragbuf[sz++]=c;
+            if (h<job.hmin && sz>=job.minfrag) {
+              boundary=true;
+              break;
+            }
+          }
+          bufptr=q-base;
+          if (boundary || sz>=job.maxfrag) break;
+        }
+        assert(sz<=job.maxfrag);
+
+        // Hash and queue the fragment
+        Frag* f=Frag::alloc(sz);
+        memcpy(f->data(), &fragbuf[0], sz);
+        f->hits=hits;
+        f->last=(c==EOF);
+        memcpy(f->o1, o1, 256);
+        libzpaq::SHA1 sha1;
+        sha1.write(f->data(), sz);
+        assert(sha1.usize()==sz);
+        memcpy(f->sha1, sha1.result(), 20);
+        job.push(f);
+        if (c==EOF) break;
+      }
+      fclose(in);
+    }
+  }
+  catch (std::exception& e) {
+    fflush(stdout);
+    fprintf(stderr, "read: %s\n", e.what());
+    exit(1);
+  }
+  return 0;
+}
+
 int Jidac::add() {
 
   // Read archive or index into ht, dt, ver.
@@ -2397,14 +2605,12 @@ int Jidac::add() {
   for (unsigned i=0; i<tid.size(); ++i) run(tid[i], compressThread, &job);
   run(wid, writeThread, &job);
 
-  // Input buffer, shared by streaming and journaling modes
-  const int BUFSIZE=1<<18;
-  libzpaq::Array<char> buf(BUFSIZE);
-
   // Append in streaming mode. Each file is a separate block. Large files
   // are split into blocks of size blocksize.
   int64_t dedupesize=0;  // input size after dedupe
   if (method[0]=='s') {
+    const int BUFSIZE=1<<18;
+    libzpaq::Array<char> buf(BUFSIZE);
     StringBuffer sb(blocksize+4096-128);
     for (unsigned fi=0; fi<vf.size(); ++fi) {
       DTMap::iterator p=vf[fi];
@@ -2490,29 +2696,46 @@ int Jidac::add() {
   unsigned exe=0;      // number of fragments containing x86 (exe, dll)
   const int ON=4;      // number of order-1 tables to save
   unsigned char o1prev[ON*256]={0};  // last ON order 1 predictions
-  libzpaq::Array<char> fragbuf(MAX_FRAGMENT);
   vector<unsigned> blocklist;  // list of starting fragments
+
+  // Start the reader threads. Each file is assigned, in order, to the
+  // least loaded reader, counting a fixed cost per file. The queues
+  // together hold about 64 MB of fragments read ahead.
+  unsigned nreaders=threads>0 ? threads : 1;
+  if (nreaders>32) nreaders=32;
+  if (nreaders>vf.size()) nreaders=vf.size();
+  ReadJob* readers=new ReadJob[nreaders];
+  vector<ThreadID> rtid(nreaders);
+  vector<unsigned char> owner(vf.size());  // reader of each file
+  {
+    vector<int64_t> load(nreaders, 0);
+    for (unsigned fi=0; fi<vf.size(); ++fi) {
+      unsigned k=0;
+      for (unsigned i=1; i<nreaders; ++i)
+        if (load[i]<load[k]) k=i;
+      owner[fi]=k;
+      load[k]+=vf[fi]->second.size+(1<<15);
+      readers[k].files.push_back(fi);
+    }
+    int64_t quota=(1<<26)/(nreaders>0 ? nreaders : 1);
+    if (quota<(1<<20)) quota=1<<20;
+    for (unsigned k=0; k<nreaders; ++k) {
+      readers[k].vf=&vf;
+      readers[k].maxfrag=MAX_FRAGMENT;
+      readers[k].minfrag=MIN_FRAGMENT;
+      readers[k].hmin=fragment<=22 ? 1u<<(22-fragment) : 0;
+      readers[k].setQuota(quota);
+      run(rtid[k], readThread, &readers[k]);
+    }
+  }
 
   // For each file to be added
   for (unsigned fi=0; fi<=vf.size(); ++fi) {
-    FP in=FPNULL;
-    int bufptr=0, buflen=0;  // read pointer and limit
-    bool eof=false;  // a short read was seen: nothing more to read
+    ReadJob* rd=0;  // reader of file fi
+    bool skipped=false;  // file could not be opened
     if (fi<vf.size()) {
       assert(vf[fi]->second.ptr.size()==0);
-      DTMap::iterator p=vf[fi];
-
-      // Open input file
-      bufptr=buflen=0;
-      in=fopen(p->first.c_str(), RB);
-      if (in==FPNULL) {  // skip if not found
-        p->second.date=0;
-        total_size-=p->second.size;
-        printerr(p->first.c_str());
-        ++errors;
-        continue;
-      }
-      p->second.data=1;  // add
+      rd=&readers[owner[fi]];
     }
 
     // Read fragments
@@ -2520,61 +2743,35 @@ int Jidac::add() {
     for (unsigned fj=0; true; ++fj) {
       int64_t sz=0;  // fragment size;
       unsigned hits=0;  // correct prediction count
-      int c=EOF;  // current byte
+      bool last=true;  // last fragment of the file
       unsigned htptr=0;  // fragment index
       char sha1result[20]={0};  // fragment hash
       unsigned char o1[256]={0};  // order 1 context -> predicted byte
-      if (fi<vf.size()) {
-        int c1=0;  // previous byte
-        unsigned h=0;  // rolling hash for finding fragment boundaries
-        const unsigned hmin=fragment<=22 ? 1u<<(22-fragment) : 0;
-        assert(in!=FPNULL);
-        while (true) {
-          if (bufptr>=buflen && !eof) {
-            bufptr=0, buflen=fread(&buf[0], 1, BUFSIZE, in);
-            eof=buflen<BUFSIZE;  // short read: end of a regular file,
-          }                      // saves a system call per file
-          if (bufptr>=buflen) {
-            c=EOF;
-            break;
-          }
-
-          // Scan buf[bufptr..buflen-1] until a fragment boundary
-          const unsigned char* const base=(const unsigned char*)&buf[0];
-          const unsigned char* p=base+bufptr;
-          const unsigned char* pend=base+buflen;
-          const int64_t room=MAX_FRAGMENT-sz;
-          assert(room>0);
-          if (pend-p>room) pend=p+room;
-          bool boundary=false;
-          while (p<pend) {
-            c=*p++;
-            // The prediction test is unpredictable, so select the
-            // multiplier arithmetically (314159265 if hit, else 271828182)
-            const unsigned hit=(c==o1[c1]);
-            h=(h+c+1)*(271828182u+hit*42331083u);
-            hits+=hit;
-            o1[c1]=c;
-            c1=c;
-            fragbuf[sz++]=c;
-            if (h<hmin && sz>=MIN_FRAGMENT) {
-              boundary=true;
-              break;
-            }
-          }
-          bufptr=p-base;
-          if (boundary || sz>=MAX_FRAGMENT) break;
+      Frag* f=0;  // fragment from the reader
+      if (rd) {
+        f=rd->pop();
+        if (f->failed) {  // skip if not found
+          assert(fj==0);
+          DTMap::iterator p=vf[fi];
+          p->second.date=0;
+          total_size-=p->second.size;
+          printerr(p->first.c_str(), f->err);
+          ++errors;
+          free(f);
+          skipped=true;
+          break;
         }
-        assert(sz<=MAX_FRAGMENT);
+        if (fj==0) vf[fi]->second.data=1;  // add
+        sz=f->sz;
+        hits=f->hits;
+        last=f->last;
+        memcpy(sha1result, f->sha1, 20);
+        memcpy(o1, f->o1, 256);
         total_done+=sz;
 
         // Look for matching fragment
-        libzpaq::SHA1 sha1;
-        sha1.write(&fragbuf[0], sz);
-        assert(uint64_t(sz)==sha1.usize());
-        memcpy(sha1result, sha1.result(), 20);
         htptr=htinv.find(sha1result);
-      }  // end if fi<vf.size()
+      }  // end if rd
 
       if (htptr==0) {  // not matched or last block
 
@@ -2674,9 +2871,9 @@ int Jidac::add() {
           memset(o1prev, 0, sizeof(o1prev));
         }
 
-        // Append fragbuf to sb and update block statistics
+        // Append the fragment to sb and update block statistics
         assert(sz==0 || fi<vf.size());
-        sb.write(&fragbuf[0], sz);
+        if (sz>0) sb.write(f->data(), sz);
         ++frags;
         redundancy+=hits;
         exe+=exe1*4;
@@ -2688,7 +2885,7 @@ int Jidac::add() {
       }  // end if frag not matched or last block
 
       // Update HT and ptr list
-      if (fi<vf.size()) {
+      if (rd) {
         if (htptr==0) {
           htptr=ht.size();
           ht.push_back(HT(sha1result, sz));
@@ -2696,10 +2893,11 @@ int Jidac::add() {
           fsize+=sz;
         }
         vf[fi]->second.ptr.push_back(htptr);
+        free(f);
       }
-      if (c==EOF) break;
+      if (last) break;
     }  // end for each fragment fj
-    if (fi<vf.size()) {
+    if (rd && !skipped) {
       dedupesize+=fsize;
       DTMap::iterator p=vf[fi];
       print_progress(total_size, total_done, summary);
@@ -2717,14 +2915,13 @@ int Jidac::add() {
         if (fsize!=p->second.size) printf(" -> %1.0f", fsize+0.0);
         printf("\n");
       }
-      assert(in!=FPNULL);
-      fclose(in);
-      in=FPNULL;
     }
   }  // end for each file fi
   assert(sb.size()==0);
 
   // Wait for jobs to finish
+  for (unsigned k=0; k<nreaders; ++k) join(rtid[k]);
+  delete[] readers;
   job.write(sb, 0, "");  // signal end of input
   for (unsigned i=0; i<tid.size(); ++i) join(tid[i]);
   join(wid);
