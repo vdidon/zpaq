@@ -2396,6 +2396,7 @@ int Jidac::add() {
   for (unsigned fi=0; fi<=vf.size(); ++fi) {
     FP in=FPNULL;
     int bufptr=0, buflen=0;  // read pointer and limit
+    bool eof=false;  // a short read was seen: nothing more to read
     if (fi<vf.size()) {
       assert(vf[fi]->second.ptr.size()==0);
       DTMap::iterator p=vf[fi];
@@ -2428,8 +2429,10 @@ int Jidac::add() {
         const unsigned hmin=fragment<=22 ? 1u<<(22-fragment) : 0;
         assert(in!=FPNULL);
         while (true) {
-          if (bufptr>=buflen)
+          if (bufptr>=buflen && !eof) {
             bufptr=0, buflen=fread(&buf[0], 1, BUFSIZE, in);
+            eof=buflen<BUFSIZE;  // short read: end of a regular file,
+          }                      // saves a system call per file
           if (bufptr>=buflen) {
             c=EOF;
             break;
