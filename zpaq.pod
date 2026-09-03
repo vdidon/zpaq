@@ -560,9 +560,14 @@ default values. With C<list>, do not list or compare attributes.
 
 With C<add> and C<list> in Windows, do not look for alternate data
 streams. Finding them requires opening every file, which takes most
-of the time to scan a large tree of small files that has not changed.
-Streams saved by an earlier C<add> without this option are marked as
-deleted in the new version.
+of the time to scan a large tree of small files. Without this option,
+a file with the same date and size as in the archive and not changed
+(NTFS change time) since an hour before the last version keeps the
+streams already in the archive instead of being opened again, unless
+-force is given. Streams saved by an earlier C<add> without this
+option are marked as deleted in the new version. After an C<add> with
+this option, the streams of unchanged files are found again only by
+an C<add> with -force.
 
 =item -not [I<file>]...
 

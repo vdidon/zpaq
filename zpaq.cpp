@@ -1018,7 +1018,9 @@ struct HT {
 struct StreamScan {
   string fn;       // file name
   int64_t edate;   // date of the file
+  int64_t esize;   // size of the file
   int64_t eattr;   // attributes of the file
+  int64_t ctime;   // NTFS change time (FILETIME), 0 if unknown
 };
 #endif
 
@@ -1067,6 +1069,28 @@ typedef HANDLE (WINAPI* FindFirstStreamW_t)
 FindFirstStreamW_t findFirstStreamW=0;
 typedef BOOL (WINAPI* FindNextStreamW_t)(HANDLE, LPVOID);
 FindNextStreamW_t findNextStreamW=0;
+typedef BOOL (WINAPI* GetFileInformationByHandleEx_t)
+                   (HANDLE, int, LPVOID, DWORD);
+GetFileInformationByHandleEx_t getFileInformationByHandleEx=0;
+
+// FILE_FULL_DIR_INFO returned by GetFileInformationByHandleEx with
+// class FileFullDirectoryInfo (14) or FileFullDirectoryRestartInfo (15):
+// like FindExInfoBasic plus the change time, which NTFS updates when
+// an alternate stream is deleted (the write time is not).
+struct FullDirInfo {
+  ULONG NextEntryOffset;
+  ULONG FileIndex;
+  LARGE_INTEGER CreationTime;
+  LARGE_INTEGER LastAccessTime;
+  LARGE_INTEGER LastWriteTime;
+  LARGE_INTEGER ChangeTime;
+  LARGE_INTEGER EndOfFile;
+  LARGE_INTEGER AllocationSize;
+  ULONG FileAttributes;
+  ULONG FileNameLength;
+  ULONG EaSize;
+  WCHAR FileName[1];
+};
 #endif
 
 class CompressJob;
@@ -1129,6 +1153,9 @@ private:
   void scanstreams();                   // add streams queued by scandir
 #ifndef unix
   vector<StreamScan> streamq;           // files to scan for streams
+  bool scandirfast(const string& prefix);  // scan a whole directory
+  void scanentry(const string& prefix, const wchar_t* name, size_t len,
+                 DWORD attr, int64_t wtime, int64_t size, int64_t ctime);
 #endif
   void addfile(string filename, int64_t edate, int64_t esize,
                int64_t eattr);          // add external file to dt
@@ -1404,6 +1431,8 @@ int Jidac::doCommand(int argc, const char** argv) {
       (FindFirstStreamW_t)GetProcAddress(h, "FindFirstStreamW");
     findNextStreamW=
       (FindNextStreamW_t)GetProcAddress(h, "FindNextStreamW");
+    getFileInformationByHandleEx=(GetFileInformationByHandleEx_t)
+      GetProcAddress(h, "GetFileInformationByHandleEx");
   }
   if (!findFirstStreamW || !findNextStreamW)
     printf("Alternate streams not supported in Windows XP.\n");
@@ -1814,9 +1843,42 @@ ThreadReturn streamThread(void* arg) {
 
 // Add to dt the alternate data streams of the files queued by scandir().
 // The enumeration runs in parallel, the insertion is done in order.
+// A file with the same date and size as in the archive and not changed
+// since an hour before the last version keeps its archived streams:
+// NTFS updates the change time when a stream is added, modified or
+// deleted, and the enumeration opens every file, which is what costs.
 void Jidac::scanstreams() {
 #ifndef unix
   if (streamq.empty()) return;
+  if (ver.size()>0 && !force && dt.size()>0) {
+    const int64_t cutoff=(int64_t(unix_time(ver.back().date))-3600
+                          +11644473600LL)*10000000LL;  // FILETIME
+    vector<StreamScan> todo;
+    for (unsigned i=0; i<streamq.size(); ++i) {
+      const StreamScan& s=streamq[i];
+      bool reuse=false;
+      if (s.ctime>0 && s.ctime<cutoff) {
+        const string an=rename(s.fn);
+        DTMap::iterator a=dt.find(an);
+        if (a!=dt.end() && a->second.date==s.edate
+            && a->second.size==s.esize) {
+          reuse=true;
+          ++a;  // streams sort after the file, possibly not right after
+          if (a!=dt.end() && a->first.compare(0, an.size(), an)==0) {
+            for (a=dt.lower_bound(an+":"); a!=dt.end()
+                 && a->first.size()>an.size() && a->first[an.size()]==':'
+                 && a->first.compare(0, an.size(), an)==0; ++a)
+              if (a->second.date)
+                addfile(s.fn+a->first.substr(an.size()), s.edate,
+                        a->second.size, s.eattr);
+          }
+        }
+      }
+      if (!reuse) todo.push_back(s);
+    }
+    streamq.swap(todo);
+    if (streamq.empty()) return;
+  }
   unsigned nt=threads>0 ? threads : 1;
   if (nt>32) nt=32;
   if (nt>streamq.size()) nt=streamq.size();
@@ -1887,12 +1949,20 @@ void Jidac::scandir(string filename) {
 
 #else  // Windows: expand wildcards in filename
 
+  string t=filename;
+  if (t.size()>0 && t[t.size()-1]=='/') t+="*";
+  const string prefix=path(t);
+
+  // A whole directory (the usual case when recursing) is read through
+  // its handle, which also gives the change time of each entry
+  if (prefix.size()>0 && t.size()==prefix.size()+1 && t[prefix.size()]=='*'
+      && getFileInformationByHandleEx && scandirfast(prefix))
+    return;
+
   // Expand wildcards. FindExInfoBasic skips the 8.3 names and
   // FIND_FIRST_EX_LARGE_FETCH reads bigger chunks: 3 times faster than
   // FindFirstFile on a big tree (Windows 7 or later, else fall back).
   WIN32_FIND_DATA ffd;
-  string t=filename;
-  if (t.size()>0 && t[t.size()-1]=='/') t+="*";
 #ifndef FIND_FIRST_EX_LARGE_FETCH
 #define FIND_FIRST_EX_LARGE_FETCH 2
 #endif
@@ -1905,50 +1975,110 @@ void Jidac::scandir(string filename) {
       && GetLastError()!=ERROR_PATH_NOT_FOUND)
     printerr(t.c_str());
   while (h!=INVALID_HANDLE_VALUE) {
-
-    // For each file, get name, date, size, attributes
-    SYSTEMTIME st;
-    int64_t edate=0;
-    if (FileTimeToSystemTime(&ffd.ftLastWriteTime, &st))
-      edate=st.wYear*10000000000LL+st.wMonth*100000000LL+st.wDay*1000000
-            +st.wHour*10000+st.wMinute*100+st.wSecond;
-    const int64_t esize=ffd.nFileSizeLow+(int64_t(ffd.nFileSizeHigh)<<32);
-    const int64_t eattr='w'+(int64_t(ffd.dwFileAttributes)<<8);
-
-    // Ignore links, the names "." and ".." or any unselected file
-    t=wtou(ffd.cFileName);
-    if (ffd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT
-        || t=="." || t=="..") edate=0;  // don't add
-    string fn=path(filename)+t;
-
-    // Save directory names with a trailing / and scan their contents
-    // Otherwise, save plain files
-    if (edate) {
-      if (ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) fn+="/";
-      addfile(fn, edate, esize, eattr);
-      if (ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-        fn+="*";
-        scandir(fn);
-      }
-
-      // Queue the file for alternate stream enumeration (Win2003/Vista
-      // or later), done in parallel by scanstreams()
-      else if (!noads && findFirstStreamW && findNextStreamW) {
-        StreamScan s;
-        s.fn=fn;
-        s.edate=edate;
-        s.eattr=eattr;
-        streamq.push_back(s);
-      }
-    }
+    scanentry(prefix, ffd.cFileName, wcslen(ffd.cFileName),
+        ffd.dwFileAttributes,
+        ffd.ftLastWriteTime.dwLowDateTime
+            +(int64_t(ffd.ftLastWriteTime.dwHighDateTime)<<32),
+        ffd.nFileSizeLow+(int64_t(ffd.nFileSizeHigh)<<32), 0);
     if (!FindNextFile(h, &ffd)) {
-      if (GetLastError()!=ERROR_NO_MORE_FILES) printerr(fn.c_str());
+      if (GetLastError()!=ERROR_NO_MORE_FILES) printerr(t.c_str());
       break;
     }
   }
   FindClose(h);
 #endif
 }
+
+#ifndef unix
+
+// Scan the directory prefix (ending with /) through a directory handle.
+// Return false without output if it cannot be opened, so that the
+// caller falls back to FindFirstFileEx and reports the error.
+bool Jidac::scandirfast(const string& prefix) {
+  string d=prefix;
+  if (d.size()>3 && d[d.size()-1]=='/') d.erase(d.size()-1);  // keep C:/
+  HANDLE h=CreateFile(utow(d.c_str()).c_str(), FILE_LIST_DIRECTORY,
+      FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE, NULL,
+      OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+  if (h==INVALID_HANDLE_VALUE) return false;
+  vector<char> buf(1<<16);
+  bool first=true;
+  DWORD err=NO_ERROR;
+  while (true) {
+    if (!getFileInformationByHandleEx(h, first ? 15 : 14, &buf[0],
+        buf.size())) {  // FileFullDirectory[Restart]Info
+      err=GetLastError();
+      break;
+    }
+    first=false;
+    for (const char* p=&buf[0];;) {
+      const FullDirInfo* e=(const FullDirInfo*)p;
+      scanentry(prefix, e->FileName, e->FileNameLength/2, e->FileAttributes,
+          e->LastWriteTime.QuadPart, e->EndOfFile.QuadPart,
+          e->ChangeTime.QuadPart);
+      if (!e->NextEntryOffset) break;
+      p+=e->NextEntryOffset;
+    }
+  }
+  CloseHandle(h);
+  if (err!=ERROR_NO_MORE_FILES) {
+    SetLastError(err);
+    printerr(prefix.c_str());
+  }
+  return true;
+}
+
+// Add to dt the entry name[0..len-1] of directory prefix (ending with /)
+// with attributes attr, write time wtime (FILETIME), size and change
+// time ctime (FILETIME, 0 if unknown). Scan the contents of a
+// directory. Queue a file for alternate stream enumeration.
+void Jidac::scanentry(const string& prefix, const wchar_t* name,
+    size_t len, DWORD attr, int64_t wtime, int64_t size, int64_t ctime) {
+
+  // Get date, attributes
+  SYSTEMTIME st;
+  FILETIME ft;
+  ft.dwLowDateTime=DWORD(wtime);
+  ft.dwHighDateTime=DWORD(uint64_t(wtime)>>32);
+  int64_t edate=0;
+  if (FileTimeToSystemTime(&ft, &st))
+    edate=st.wYear*10000000000LL+st.wMonth*100000000LL+st.wDay*1000000
+          +st.wHour*10000+st.wMinute*100+st.wSecond;
+  const int64_t eattr='w'+(int64_t(attr)<<8);
+
+  // Ignore links, the names "." and ".." or any unselected file
+  const string t=wtou(std::wstring(name, len).c_str());
+  if (attr & FILE_ATTRIBUTE_REPARSE_POINT
+      || t=="." || t=="..") edate=0;  // don't add
+  if (!edate) return;
+  string fn=prefix+t;
+
+  // Save directory names with a trailing / and scan their contents
+  // Otherwise, save plain files
+  if (attr & FILE_ATTRIBUTE_DIRECTORY) {
+    fn+="/";
+    addfile(fn, edate, size, eattr);
+    fn+="*";
+    scandir(fn);
+  }
+  else {
+    addfile(fn, edate, size, eattr);
+
+    // Queue the file for alternate stream enumeration (Win2003/Vista
+    // or later), done in parallel by scanstreams()
+    if (!noads && findFirstStreamW && findNextStreamW) {
+      StreamScan s;
+      s.fn=fn;
+      s.edate=edate;
+      s.esize=size;
+      s.eattr=eattr;
+      s.ctime=ctime;
+      streamq.push_back(s);
+    }
+  }
+}
+
+#endif
 
 // Add external file and its date, size, and attributes to dt
 void Jidac::addfile(string filename, int64_t edate,
