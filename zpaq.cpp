@@ -2833,14 +2833,65 @@ struct ExtractJob {         // list of jobs
   double maxMemory;         // largest memory used by any block (test mode)
   int64_t total_size;       // bytes to extract
   int64_t total_done;       // bytes extracted so far
+
+  // Output files spanning several blocks stay open between blocks so
+  // that each file is opened and closed once. A handle is removed from
+  // the cache while a thread writes to it. Bounded: when full, the
+  // least recently used handle is closed (without setting the date) and
+  // the file is reopened later. Protected by mutex.
+  enum {MAXOPEN=64};
+  struct OpenFile {FP fp; unsigned age;};
+  map<const DT*, OpenFile> open;
+  unsigned clock;
+
   ExtractJob(Jidac& j): job(0), jd(j),
-      maxMemory(0), total_size(0), total_done(0) {
+      maxMemory(0), total_size(0), total_done(0), clock(0) {
     init_mutex(mutex);
     for (int i=0; i<NFILEMUTEX; ++i) init_mutex(file_mutex[i]);
   }
   ~ExtractJob() {
     for (int i=0; i<NFILEMUTEX; ++i) destroy_mutex(file_mutex[i]);
     destroy_mutex(mutex);
+  }
+
+  // Remove and return the cached handle of p, or FPNULL
+  FP takeOpen(DTMap::iterator p) {
+    FP fp=FPNULL;
+    lock(mutex);
+    map<const DT*, OpenFile>::iterator i=open.find(&p->second);
+    if (i!=open.end()) fp=i->second.fp, open.erase(i);
+    release(mutex);
+    return fp;
+  }
+
+  // Cache handle fp of file p for later blocks. The evicted handle is
+  // closed under the lock: output files are opened without write
+  // sharing, so nobody may reopen it before it is closed.
+  void putOpen(DTMap::iterator p, FP fp) {
+    assert(fp!=FPNULL);
+    lock(mutex);
+    if (open.size()>=MAXOPEN) {  // evict the least recently used
+      map<const DT*, OpenFile>::iterator v=open.begin();
+      for (map<const DT*, OpenFile>::iterator i=open.begin();
+           i!=open.end(); ++i)
+        if (i->second.age<v->second.age) v=i;
+      close("", 0, 0, v->second.fp);
+      open.erase(v);
+    }
+    OpenFile& f=open[&p->second];
+    f.fp=fp;
+    f.age=clock++;
+    release(mutex);
+  }
+
+  // Close all cached handles (after the threads finished)
+  void closeAll() {
+    lock(mutex);
+    for (map<const DT*, OpenFile>::iterator i=open.begin();
+         i!=open.end(); ++i)
+      close("", 0, 0, i->second.fp);
+    open.clear();
+    release(mutex);
   }
 
   // Return the lock that protects writing to output file p
@@ -3039,8 +3090,10 @@ ThreadReturn decompressThread(void* arg) {
 #endif
             }
           }
-          else if (!job.jd.dotest)
-            outf=fopen(filename.c_str(), RBPLUS);  // update existing file
+          else if (!job.jd.dotest) {  // update existing file
+            outf=job.takeOpen(p);  // still open from a previous block?
+            if (outf==FPNULL) outf=fopen(filename.c_str(), RBPLUS);
+          }
           if (!job.jd.dotest && outf==FPNULL) break;  // skip errors
         }
         assert(job.jd.dotest || outf!=FPNULL);
@@ -3088,15 +3141,17 @@ ThreadReturn decompressThread(void* arg) {
         release(job.mutex);
       } // end for j
 
-      // Close file. If this was the last fragment then set date and attr.
+      // If this was the last fragment then close the file and set date
+      // and attr, else keep it open for the following blocks.
       // Do not set read-only attribute in Windows yet.
       if (outf!=FPNULL) {
-        int64_t attr=p->second.attr;
-        int64_t date=p->second.date;
-        if ((p->second.attr&0x1ff)=='w'+256) attr=0;  // read-only?
-        if (p->second.data!=int64_t(ptr.size()))
-          date=attr=0;  // not last frag
-        close(filename.c_str(), date, attr, outf);
+        if (p->second.data!=int64_t(ptr.size()))  // not last frag
+          job.putOpen(p, outf);
+        else {
+          int64_t attr=p->second.attr;
+          if ((p->second.attr&0x1ff)=='w'+256) attr=0;  // read-only?
+          close(filename.c_str(), p->second.date, attr, outf);
+        }
       }
       release(fmutex);
     } // end for ip
@@ -3499,6 +3554,7 @@ int Jidac::extract() {
 
   // Wait for threads to finish
   for (unsigned i=0; i<tid.size(); ++i) join(tid[i]);
+  job.closeAll();  // files left open by blocks that failed
 
   // Create empty directories and set file dates and attributes
   if (!dotest) {
