@@ -993,6 +993,15 @@ struct HT {
 };
 
 // filename entry
+#ifndef unix
+// A file queued by scandir() for alternate data stream enumeration
+struct StreamScan {
+  string fn;       // file name
+  int64_t edate;   // date of the file
+  int64_t eattr;   // attributes of the file
+};
+#endif
+
 struct DT {
   int64_t date;          // decimal YYYYMMDDHHMMSS (UT) or 0 if deleted
   int64_t size;          // size or -1 if unknown
@@ -1096,6 +1105,10 @@ private:
   int64_t read_archive(const char* arc, int *errors=0);  // read arc
   bool isselected(const char* filename, bool rn=false);// files, -only, -not
   void scandir(string filename);        // scan dirs to dt
+  void scanstreams();                   // add streams queued by scandir
+#ifndef unix
+  vector<StreamScan> streamq;           // files to scan for streams
+#endif
   void addfile(string filename, int64_t edate, int64_t esize,
                int64_t eattr);          // add external file to dt
   void list_versions(int64_t csize);    // print ver. csize=archive size
@@ -1727,6 +1740,82 @@ string path(const string& fn) {
   return fn.substr(0, n);
 }
 
+#ifndef unix
+
+// Alternate data stream enumeration of the files queued by scandir(),
+// shared by the threads of scanstreams(). FindFirstStream costs tens of
+// microseconds per file, which dominates the scan of many small files
+// when done serially.
+struct StreamJob {
+  struct Result {  // a stream found
+    unsigned i;    // index in q
+    string name;   // stream name (":name:$DATA")
+    int64_t size;  // stream size
+  };
+  const vector<StreamScan>& q;      // files to scan
+  volatile LONG next;               // next index in q to scan
+  vector<vector<Result> > results;  // streams found, per thread
+  StreamJob(const vector<StreamScan>& q_, unsigned nthreads):
+      q(q_), next(0), results(nthreads) {}
+};
+
+struct StreamThreadArg {
+  StreamJob* job;
+  unsigned id;  // thread number
+};
+
+// Enumerate the streams of the files of job.q, taken in order
+ThreadReturn streamThread(void* arg) {
+  StreamJob& job=*((StreamThreadArg*)arg)->job;
+  vector<StreamJob::Result>& out=job.results[((StreamThreadArg*)arg)->id];
+  while (true) {
+    const unsigned i=InterlockedIncrement(&job.next)-1;
+    if (i>=job.q.size()) break;
+    WIN32_FIND_STREAM_DATA fsd;
+    HANDLE ah=findFirstStreamW(utow(job.q[i].fn.c_str()).c_str(),
+        FindStreamInfoStandard, &fsd, 0);
+    while (ah!=INVALID_HANDLE_VALUE && findNextStreamW(ah, &fsd)) {
+      StreamJob::Result r;
+      r.i=i;
+      r.name=wtou(fsd.cStreamName);
+      r.size=fsd.StreamSize.QuadPart;
+      out.push_back(r);
+    }
+    if (ah!=INVALID_HANDLE_VALUE) FindClose(ah);
+  }
+  return 0;
+}
+
+#endif
+
+// Add to dt the alternate data streams of the files queued by scandir().
+// The enumeration runs in parallel, the insertion is done in order.
+void Jidac::scanstreams() {
+#ifndef unix
+  if (streamq.empty()) return;
+  unsigned nt=threads>0 ? threads : 1;
+  if (nt>32) nt=32;
+  if (nt>streamq.size()) nt=streamq.size();
+  StreamJob job(streamq, nt);
+  vector<StreamThreadArg> args(nt);
+  vector<ThreadID> tid(nt);
+  for (unsigned i=0; i<nt; ++i) {
+    args[i].job=&job;
+    args[i].id=i;
+    run(tid[i], streamThread, &args[i]);
+  }
+  for (unsigned i=0; i<nt; ++i) join(tid[i]);
+  for (unsigned t=0; t<nt; ++t) {
+    for (unsigned j=0; j<job.results[t].size(); ++j) {
+      const StreamJob::Result& r=job.results[t][j];
+      const StreamScan& s=streamq[r.i];
+      addfile(s.fn+r.name, s.edate, r.size, s.eattr);
+    }
+  }
+  vector<StreamScan>().swap(streamq);  // free the queue
+#endif
+}
+
 // Insert external filename (UTF-8 with "/") into dt if selected
 // by files, onlyfiles, and notfiles. If filename
 // is a directory then also insert its contents.
@@ -1810,15 +1899,14 @@ void Jidac::scandir(string filename) {
         scandir(fn);
       }
 
-      // enumerate alternate streams (Win2003/Vista or later)
+      // Queue the file for alternate stream enumeration (Win2003/Vista
+      // or later), done in parallel by scanstreams()
       else if (findFirstStreamW && findNextStreamW) {
-        WIN32_FIND_STREAM_DATA fsd;
-        HANDLE ah=findFirstStreamW(utow(fn.c_str()).c_str(),
-            FindStreamInfoStandard, &fsd, 0);
-        while (ah!=INVALID_HANDLE_VALUE && findNextStreamW(ah, &fsd))
-          addfile(fn+wtou(fsd.cStreamName), edate,
-              fsd.StreamSize.QuadPart, eattr);
-        if (ah!=INVALID_HANDLE_VALUE) FindClose(ah);
+        StreamScan s;
+        s.fn=fn;
+        s.edate=edate;
+        s.eattr=eattr;
+        streamq.push_back(s);
       }
     }
     if (!FindNextFile(h, &ffd)) {
@@ -2244,6 +2332,7 @@ int Jidac::add() {
   // Make list of files to add or delete
   for (unsigned i=0; i<files.size(); ++i)
     scandir(files[i].c_str());
+  scanstreams();
 
   // Sort the files to be added by filename extension and decreasing size
   vector<DTMap::iterator> vf;
@@ -3626,6 +3715,7 @@ int Jidac::list() {
   // Read external files into edt
   for (unsigned i=0; i<files.size(); ++i)
     scandir(files[i].c_str());
+  scanstreams();
   if (files.size()) printf("%d external files.\n", int(edt.size()));
   printf("\n");
 
