@@ -2445,8 +2445,11 @@ int Jidac::add() {
           bool boundary=false;
           while (p<pend) {
             c=*p++;
-            if (c==o1[c1]) h=(h+c+1)*314159265u, ++hits;
-            else h=(h+c+1)*271828182u;
+            // The prediction test is unpredictable, so select the
+            // multiplier arithmetically (314159265 if hit, else 271828182)
+            const unsigned hit=(c==o1[c1]);
+            h=(h+c+1)*(271828182u+hit*42331083u);
+            hits+=hit;
             o1[c1]=c;
             c1=c;
             fragbuf[sz++]=c;
