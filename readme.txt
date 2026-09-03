@@ -73,6 +73,10 @@ Options have the following meanings:
 -DNOJIT  = turn off run time optimization of ZPAQL to 32 or 64 bit x86
            in libzpaq. Use this for a non-x86 processor, or old
            processors not supporting SSE2 (mostly before 2001).
+-DNOSHANI = turn off SHA-1 hardware acceleration (x86 SHA extensions)
+           in libzpaq. It is otherwise compiled in with g++ 5 or later,
+           clang or Visual Studio 2017 or later, and used only if the
+           CPU supports it (detected at run time).
 -pthread = link to pthread library (required in unix/Linux).
 
 General options:

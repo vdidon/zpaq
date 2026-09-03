@@ -37,6 +37,38 @@ See libzpaq.h for additional documentation.
 #include <wincrypt.h>
 #endif
 
+#ifdef _MSC_VER
+#include <intrin.h>
+#endif
+
+// Memory prefetch hint (no-op if the compiler does not support it)
+#if defined(__GNUC__) || defined(__clang__)
+#define ZPAQ_PREFETCH(p) __builtin_prefetch(p)
+#elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+#define ZPAQ_PREFETCH(p) _mm_prefetch((const char*)(p), _MM_HINT_T0)
+#else
+#define ZPAQ_PREFETCH(p) ((void)0)
+#endif
+
+// SHA-1 hardware acceleration using x86 SHA extensions, selected at run
+// time if the CPU supports it. Requires g++ 5 or later, clang, or
+// Visual Studio 2017 or later. Compile with -DNOSHANI to disable.
+#ifndef NOSHANI
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) \
+    || defined(_M_IX86)
+#if defined(__clang__) || (defined(__GNUC__) && __GNUC__>=5)
+#define ZPAQ_SHANI 1
+#include <immintrin.h>
+#include <cpuid.h>
+#define ZPAQ_SHANI_TARGET __attribute__((target("sha,sse4.1,ssse3")))
+#elif defined(_MSC_VER) && _MSC_VER>=1910
+#define ZPAQ_SHANI 1
+#include <immintrin.h>
+#define ZPAQ_SHANI_TARGET
+#endif
+#endif
+#endif
+
 namespace libzpaq {
 
 // Read 16 bit little-endian number
@@ -143,10 +175,237 @@ const char* SHA1::result() {
   return hbuf;
 }
 
+#ifdef ZPAQ_SHANI
+
+// Return true if the CPU supports the SHA, SSE4.1 and SSSE3 extensions
+static bool detectSHANI() {
+  unsigned b=0, c=0;
+#if defined(_MSC_VER) && !defined(__clang__)
+  int r[4]={0};
+  __cpuid(r, 0);
+  if (unsigned(r[0])<7) return false;
+  __cpuid(r, 1);
+  c=r[2];
+  if (!(c&(1u<<19)) || !(c&(1u<<9))) return false;  // SSE4.1, SSSE3
+  __cpuidex(r, 7, 0);
+  b=r[1];
+#else
+  unsigned a=0, d=0;
+  if (__get_cpuid_max(0, 0)<7) return false;
+  __cpuid_count(1, 0, a, b, c, d);
+  if (!(c&(1u<<19)) || !(c&(1u<<9))) return false;  // SSE4.1, SSSE3
+  __cpuid_count(7, 0, a, b, c, d);
+#endif
+  return (b&(1u<<29))!=0;  // SHA
+}
+static const bool haveSHANI=detectSHANI();
+
+// 80 rounds of SHA-1 on state (ABCD, E0) with a 64 byte message in
+// MSG0..MSG3, each holding 4 big-endian words, first word in the high lane.
+ZPAQ_SHANI_TARGET static inline void sha1Rounds(__m128i& ABCD, __m128i& E0,
+    __m128i MSG0, __m128i MSG1, __m128i MSG2, __m128i MSG3) {
+  const __m128i ABCD_SAVE=ABCD, E0_SAVE=E0;
+  __m128i E1;
+
+  // Rounds 0-3
+  E0=_mm_add_epi32(E0, MSG0);
+  E1=ABCD;
+  ABCD=_mm_sha1rnds4_epu32(ABCD, E0, 0);
+
+  // Rounds 4-7
+  E1=_mm_sha1nexte_epu32(E1, MSG1);
+  E0=ABCD;
+  ABCD=_mm_sha1rnds4_epu32(ABCD, E1, 0);
+  MSG0=_mm_sha1msg1_epu32(MSG0, MSG1);
+
+  // Rounds 8-11
+  E0=_mm_sha1nexte_epu32(E0, MSG2);
+  E1=ABCD;
+  ABCD=_mm_sha1rnds4_epu32(ABCD, E0, 0);
+  MSG1=_mm_sha1msg1_epu32(MSG1, MSG2);
+  MSG0=_mm_xor_si128(MSG0, MSG2);
+
+  // Rounds 12-15
+  E1=_mm_sha1nexte_epu32(E1, MSG3);
+  E0=ABCD;
+  MSG0=_mm_sha1msg2_epu32(MSG0, MSG3);
+  ABCD=_mm_sha1rnds4_epu32(ABCD, E1, 0);
+  MSG2=_mm_sha1msg1_epu32(MSG2, MSG3);
+  MSG1=_mm_xor_si128(MSG1, MSG3);
+
+  // Rounds 16-19
+  E0=_mm_sha1nexte_epu32(E0, MSG0);
+  E1=ABCD;
+  MSG1=_mm_sha1msg2_epu32(MSG1, MSG0);
+  ABCD=_mm_sha1rnds4_epu32(ABCD, E0, 0);
+  MSG3=_mm_sha1msg1_epu32(MSG3, MSG0);
+  MSG2=_mm_xor_si128(MSG2, MSG0);
+
+  // Rounds 20-23
+  E1=_mm_sha1nexte_epu32(E1, MSG1);
+  E0=ABCD;
+  MSG2=_mm_sha1msg2_epu32(MSG2, MSG1);
+  ABCD=_mm_sha1rnds4_epu32(ABCD, E1, 1);
+  MSG0=_mm_sha1msg1_epu32(MSG0, MSG1);
+  MSG3=_mm_xor_si128(MSG3, MSG1);
+
+  // Rounds 24-27
+  E0=_mm_sha1nexte_epu32(E0, MSG2);
+  E1=ABCD;
+  MSG3=_mm_sha1msg2_epu32(MSG3, MSG2);
+  ABCD=_mm_sha1rnds4_epu32(ABCD, E0, 1);
+  MSG1=_mm_sha1msg1_epu32(MSG1, MSG2);
+  MSG0=_mm_xor_si128(MSG0, MSG2);
+
+  // Rounds 28-31
+  E1=_mm_sha1nexte_epu32(E1, MSG3);
+  E0=ABCD;
+  MSG0=_mm_sha1msg2_epu32(MSG0, MSG3);
+  ABCD=_mm_sha1rnds4_epu32(ABCD, E1, 1);
+  MSG2=_mm_sha1msg1_epu32(MSG2, MSG3);
+  MSG1=_mm_xor_si128(MSG1, MSG3);
+
+  // Rounds 32-35
+  E0=_mm_sha1nexte_epu32(E0, MSG0);
+  E1=ABCD;
+  MSG1=_mm_sha1msg2_epu32(MSG1, MSG0);
+  ABCD=_mm_sha1rnds4_epu32(ABCD, E0, 1);
+  MSG3=_mm_sha1msg1_epu32(MSG3, MSG0);
+  MSG2=_mm_xor_si128(MSG2, MSG0);
+
+  // Rounds 36-39
+  E1=_mm_sha1nexte_epu32(E1, MSG1);
+  E0=ABCD;
+  MSG2=_mm_sha1msg2_epu32(MSG2, MSG1);
+  ABCD=_mm_sha1rnds4_epu32(ABCD, E1, 1);
+  MSG0=_mm_sha1msg1_epu32(MSG0, MSG1);
+  MSG3=_mm_xor_si128(MSG3, MSG1);
+
+  // Rounds 40-43
+  E0=_mm_sha1nexte_epu32(E0, MSG2);
+  E1=ABCD;
+  MSG3=_mm_sha1msg2_epu32(MSG3, MSG2);
+  ABCD=_mm_sha1rnds4_epu32(ABCD, E0, 2);
+  MSG1=_mm_sha1msg1_epu32(MSG1, MSG2);
+  MSG0=_mm_xor_si128(MSG0, MSG2);
+
+  // Rounds 44-47
+  E1=_mm_sha1nexte_epu32(E1, MSG3);
+  E0=ABCD;
+  MSG0=_mm_sha1msg2_epu32(MSG0, MSG3);
+  ABCD=_mm_sha1rnds4_epu32(ABCD, E1, 2);
+  MSG2=_mm_sha1msg1_epu32(MSG2, MSG3);
+  MSG1=_mm_xor_si128(MSG1, MSG3);
+
+  // Rounds 48-51
+  E0=_mm_sha1nexte_epu32(E0, MSG0);
+  E1=ABCD;
+  MSG1=_mm_sha1msg2_epu32(MSG1, MSG0);
+  ABCD=_mm_sha1rnds4_epu32(ABCD, E0, 2);
+  MSG3=_mm_sha1msg1_epu32(MSG3, MSG0);
+  MSG2=_mm_xor_si128(MSG2, MSG0);
+
+  // Rounds 52-55
+  E1=_mm_sha1nexte_epu32(E1, MSG1);
+  E0=ABCD;
+  MSG2=_mm_sha1msg2_epu32(MSG2, MSG1);
+  ABCD=_mm_sha1rnds4_epu32(ABCD, E1, 2);
+  MSG0=_mm_sha1msg1_epu32(MSG0, MSG1);
+  MSG3=_mm_xor_si128(MSG3, MSG1);
+
+  // Rounds 56-59
+  E0=_mm_sha1nexte_epu32(E0, MSG2);
+  E1=ABCD;
+  MSG3=_mm_sha1msg2_epu32(MSG3, MSG2);
+  ABCD=_mm_sha1rnds4_epu32(ABCD, E0, 2);
+  MSG1=_mm_sha1msg1_epu32(MSG1, MSG2);
+  MSG0=_mm_xor_si128(MSG0, MSG2);
+
+  // Rounds 60-63
+  E1=_mm_sha1nexte_epu32(E1, MSG3);
+  E0=ABCD;
+  MSG0=_mm_sha1msg2_epu32(MSG0, MSG3);
+  ABCD=_mm_sha1rnds4_epu32(ABCD, E1, 3);
+  MSG2=_mm_sha1msg1_epu32(MSG2, MSG3);
+  MSG1=_mm_xor_si128(MSG1, MSG3);
+
+  // Rounds 64-67
+  E0=_mm_sha1nexte_epu32(E0, MSG0);
+  E1=ABCD;
+  MSG1=_mm_sha1msg2_epu32(MSG1, MSG0);
+  ABCD=_mm_sha1rnds4_epu32(ABCD, E0, 3);
+  MSG3=_mm_sha1msg1_epu32(MSG3, MSG0);
+  MSG2=_mm_xor_si128(MSG2, MSG0);
+
+  // Rounds 68-71
+  E1=_mm_sha1nexte_epu32(E1, MSG1);
+  E0=ABCD;
+  MSG2=_mm_sha1msg2_epu32(MSG2, MSG1);
+  ABCD=_mm_sha1rnds4_epu32(ABCD, E1, 3);
+  MSG3=_mm_xor_si128(MSG3, MSG1);
+
+  // Rounds 72-75
+  E0=_mm_sha1nexte_epu32(E0, MSG2);
+  E1=ABCD;
+  MSG3=_mm_sha1msg2_epu32(MSG3, MSG2);
+  ABCD=_mm_sha1rnds4_epu32(ABCD, E0, 3);
+
+  // Rounds 76-79
+  E1=_mm_sha1nexte_epu32(E1, MSG3);
+  E0=ABCD;
+  ABCD=_mm_sha1rnds4_epu32(ABCD, E1, 3);
+
+  // Add saved state
+  E0=_mm_sha1nexte_epu32(E0, E0_SAVE);
+  ABCD=_mm_add_epi32(ABCD, ABCD_SAVE);
+}
+
+// Hash one 64 byte block already split into big-endian words w[0..15]
+ZPAQ_SHANI_TARGET static void sha1ProcessWords(U32* h, const U32* w) {
+  __m128i ABCD=_mm_shuffle_epi32(_mm_loadu_si128((const __m128i*)h), 0x1B);
+  __m128i E0=_mm_set_epi32(h[4], 0, 0, 0);
+  sha1Rounds(ABCD, E0,
+      _mm_shuffle_epi32(_mm_loadu_si128((const __m128i*)(w+0)), 0x1B),
+      _mm_shuffle_epi32(_mm_loadu_si128((const __m128i*)(w+4)), 0x1B),
+      _mm_shuffle_epi32(_mm_loadu_si128((const __m128i*)(w+8)), 0x1B),
+      _mm_shuffle_epi32(_mm_loadu_si128((const __m128i*)(w+12)), 0x1B));
+  _mm_storeu_si128((__m128i*)h, _mm_shuffle_epi32(ABCD, 0x1B));
+  h[4]=_mm_extract_epi32(E0, 3);
+}
+
+// Hash n 64 byte blocks at p
+ZPAQ_SHANI_TARGET static void sha1ProcessBytes(U32* h, const unsigned char* p,
+                                               size_t n) {
+  const __m128i MASK=_mm_set_epi64x(0x0001020304050607LL,
+                                    0x08090a0b0c0d0e0fLL);
+  __m128i ABCD=_mm_shuffle_epi32(_mm_loadu_si128((const __m128i*)h), 0x1B);
+  __m128i E0=_mm_set_epi32(h[4], 0, 0, 0);
+  for (; n>0; --n, p+=64) {
+    sha1Rounds(ABCD, E0,
+        _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)(p+0)), MASK),
+        _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)(p+16)), MASK),
+        _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)(p+32)), MASK),
+        _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)(p+48)), MASK));
+  }
+  _mm_storeu_si128((__m128i*)h, _mm_shuffle_epi32(ABCD, 0x1B));
+  h[4]=_mm_extract_epi32(E0, 3);
+}
+
+#endif  // ZPAQ_SHANI
+
 // Hash buf[0..n-1]
 void SHA1::write(const char* buf, int64_t n) {
   const unsigned char* p=(const unsigned char*) buf;
   for (; n>0 && (U32(len)&511)!=0; --n) put(*p++);
+#ifdef ZPAQ_SHANI
+  if (haveSHANI && n>=64) {
+    const int64_t nb=n>>6;  // number of whole blocks
+    sha1ProcessBytes(h, p, size_t(nb));
+    p+=nb<<6;
+    len+=nb<<9;
+    n-=nb<<6;
+  }
+#endif
   for (; n>=64; n-=64) {
     for (int i=0; i<16; ++i)
       w[i]=p[0]<<24|p[1]<<16|p[2]<<8|p[3], p+=4;
@@ -158,6 +417,12 @@ void SHA1::write(const char* buf, int64_t n) {
 
 // Hash 1 block of 64 bytes
 void SHA1::process() {
+#ifdef ZPAQ_SHANI
+  if (haveSHANI) {
+    sha1ProcessWords(h, w);
+    return;
+  }
+#endif
   U32 a=h[0], b=h[1], c=h[2], d=h[3], e=h[4];
   static const U32 k[4]={0x5A827999, 0x6ED9EBA1, 0x8F1BBCDC, 0xCA62C1D6};
   #define f(a,b,c,d,e,i) \
@@ -6484,6 +6749,8 @@ class LZBuffer: public libzpaq::Reader {
   const unsigned maxLiteral;  // longest literal length allowed
   const unsigned lookahead;   // second context look ahead
   unsigned h1, h2;            // low, high order context hashes of in[i..]
+  unsigned h1p, h2p;          // same hashes PREFETCH_DIST positions ahead
+  enum {PREFETCH_DIST=8};     // prefetch distance for ht lookups
   const unsigned bucket;      // number of matches to search per hash - 1
   const unsigned shift1, shift2;  // how far to shift h1, h2 per hash
   const int minMatchBoth;     // max(minMatch, minMatch2)
@@ -6608,8 +6875,8 @@ LZBuffer::LZBuffer(StringBuffer& inbuf, int args[], const unsigned* sap):
     maxMatch(BUFSIZE*3),
     maxLiteral(BUFSIZE/4),
     lookahead(args[6]),
-    h1(0), h2(0),
-    bucket((1<<args[4])-1), 
+    h1(0), h2(0), h1p(0), h2p(0),
+    bucket((1<<args[4])-1),
     shift1(minMatch>0 ? (args[5]-1)/minMatch+1 : 1),
     shift2(minMatch2>0 ? (args[5]-1)/minMatch2+1 : 0),
     minMatchBoth(MAX(minMatch, minMatch2+lookahead)+4),
@@ -6641,6 +6908,37 @@ LZBuffer::LZBuffer(StringBuffer& inbuf, int args[], const unsigned* sap):
       isa=&ht[n*(sap==0)];
     }
   }
+}
+
+// Return the length of the match between a[0..] and b[0..], at most limit,
+// starting the comparison at offset l0 (bytes before l0 are assumed equal).
+// Compares 8 bytes at a time on little-endian machines.
+static inline unsigned matchLength(const unsigned char* a,
+    const unsigned char* b, unsigned l0, unsigned limit) {
+  unsigned l=l0;
+#if (defined(__GNUC__) || defined(__clang__)) && (defined(__x86_64__)     || defined(__i386__) || (defined(__BYTE_ORDER__)     && __BYTE_ORDER__==__ORDER_LITTLE_ENDIAN__))
+  while (l+8<=limit) {
+    U64 x, y;
+    memcpy(&x, a+l, 8);
+    memcpy(&y, b+l, 8);
+    if (x!=y) return l+(__builtin_ctzll(x^y)>>3);
+    l+=8;
+  }
+#elif defined(_MSC_VER) && defined(_M_X64)
+  while (l+8<=limit) {
+    U64 x, y;
+    memcpy(&x, a+l, 8);
+    memcpy(&y, b+l, 8);
+    if (x!=y) {
+      unsigned long k;
+      _BitScanForward64(&k, x^y);
+      return l+(k>>3);
+    }
+    l+=8;
+  }
+#endif
+  while (l<limit && a[l]==b[l]) ++l;
+  return l;
 }
 
 // Encode from in to buf until end of input or buf is not empty
@@ -6686,7 +6984,7 @@ void LZBuffer::fill() {
             if (q+j*k<n && (p=sa[q+j*k]-h)<i) {
               assert(p<n);
               unsigned l, l1;  // length of match, leading literals
-              for (l=h; i+l<n && l<maxMatch && in[p+l]==in[i+l]; ++l);
+              l=matchLength(in+p, in+i, h, MIN(maxMatch, n-i));
               for (l1=h; l1>0 && in[p+l1-1]==in[i+l1-1]; --l1);
               int score=int(l-l1)*8-lg(i-p)-4*(lit==0 && l1>0)-11;
               for (unsigned a=0; a<h; ++a) score=score*5/8;
@@ -6710,7 +7008,7 @@ void LZBuffer::fill() {
             p>>=checkbits;
             if (p<i && i+blen<=n && in[p+blen-1]==in[i+blen-1]) {
               unsigned l;  // match length from lookahead
-              for (l=lookahead; i+l<n && l<maxMatch && in[p+l]==in[i+l]; ++l);
+              l=matchLength(in+p, in+i, lookahead, MIN(maxMatch, n-i));
               if (l>=minMatch2+lookahead) {
                 int l1;  // length back from lookahead
                 for (l1=lookahead; l1>0 && in[p+l1-1]==in[i+l1-1]; --l1);
@@ -6732,7 +7030,7 @@ void LZBuffer::fill() {
             p>>=checkbits;
             if (p<i && i+blen<=n && in[p+blen-1]==in[i+blen-1]) {
               unsigned l;
-              for (l=0; i+l<n && l<maxMatch && in[p+l]==in[i+l]; ++l);
+              l=matchLength(in+p, in+i, 0, MIN(maxMatch, n-i));
               int score=l*8-lg(i-p)-2*(lit>0)-11;
               if (score>bscore) blen=l, bp=p, blit=0, bscore=score;
             }
@@ -6775,6 +7073,21 @@ void LZBuffer::fill() {
           }
           ht[h1^ih]=p;
           h1=(((h1*5)<<shift1)+(in[i+minMatch]+1)*123456791u)&(htsize-1);
+
+          // Prefetch the hash table rows that will be searched
+          // PREFETCH_DIST positions from now. h1p and h2p depend only on
+          // the last few input bytes so they need no initialization.
+          if (i+PREFETCH_DIST+minMatchBoth<n) {
+            const unsigned ip=i+PREFETCH_DIST;
+            if (minMatch2) {
+              h2p=(((h2p*9)<<shift2)
+                  +(in[ip+minMatch2+lookahead]+1)*23456789u)&(htsize-1);
+              ZPAQ_PREFETCH(&ht[h2p]);
+            }
+            h1p=(((h1p*5)<<shift1)+(in[ip+minMatch]+1)*123456791u)
+                &(htsize-1);
+            ZPAQ_PREFETCH(&ht[h1p]);
+          }
         }
         ++i;
       }
