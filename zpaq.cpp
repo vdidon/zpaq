@@ -400,8 +400,10 @@ FP fopen(const char* filename, MODE mode) {
   if (mode==RB || mode==RBPLUS) disp=OPEN_EXISTING;
   DWORD share=FILE_SHARE_READ;
   if (mode==RB) share|=FILE_SHARE_WRITE|FILE_SHARE_DELETE;
+  DWORD flags=FILE_ATTRIBUTE_NORMAL;
+  if (mode==RB) flags|=FILE_FLAG_SEQUENTIAL_SCAN;  // hint for read-ahead
   return CreateFile(utow(filename).c_str(), access, share,
-                    NULL, disp, FILE_ATTRIBUTE_NORMAL, NULL);
+                    NULL, disp, flags, NULL);
 }
 
 // Close file
@@ -2294,6 +2296,10 @@ int Jidac::add() {
   for (unsigned i=0; i<tid.size(); ++i) run(tid[i], compressThread, &job);
   run(wid, writeThread, &job);
 
+  // Input buffer, shared by streaming and journaling modes
+  const int BUFSIZE=1<<18;
+  libzpaq::Array<char> buf(BUFSIZE);
+
   // Append in streaming mode. Each file is a separate block. Large files
   // are split into blocks of size blocksize.
   int64_t dedupesize=0;  // input size after dedupe
@@ -2315,11 +2321,9 @@ int Jidac::add() {
         continue;
       }
       uint64_t i=0;
-      const int BUFSIZE=4096;
-      char buf[BUFSIZE];
       while (true) {
-        int r=fread(buf, 1, BUFSIZE, in);
-        sb.write(buf, r);
+        int r=fread(&buf[0], 1, BUFSIZE, in);
+        sb.write(&buf[0], r);
         i+=r;
         if (r==0 || sb.size()+BUFSIZE>blocksize) {
           string filename="";
@@ -2391,8 +2395,6 @@ int Jidac::add() {
   // For each file to be added
   for (unsigned fi=0; fi<=vf.size(); ++fi) {
     FP in=FPNULL;
-    const int BUFSIZE=4096;  // input buffer
-    char buf[BUFSIZE];
     int bufptr=0, buflen=0;  // read pointer and limit
     if (fi<vf.size()) {
       assert(vf[fi]->second.ptr.size()==0);
@@ -2423,29 +2425,45 @@ int Jidac::add() {
       if (fi<vf.size()) {
         int c1=0;  // previous byte
         unsigned h=0;  // rolling hash for finding fragment boundaries
-        libzpaq::SHA1 sha1;
+        const unsigned hmin=fragment<=22 ? 1u<<(22-fragment) : 0;
         assert(in!=FPNULL);
         while (true) {
-          if (bufptr>=buflen) bufptr=0, buflen=fread(buf, 1, BUFSIZE, in);
-          if (bufptr>=buflen) c=EOF;
-          else c=(unsigned char)buf[bufptr++];
-          if (c!=EOF) {
+          if (bufptr>=buflen)
+            bufptr=0, buflen=fread(&buf[0], 1, BUFSIZE, in);
+          if (bufptr>=buflen) {
+            c=EOF;
+            break;
+          }
+
+          // Scan buf[bufptr..buflen-1] until a fragment boundary
+          const unsigned char* const base=(const unsigned char*)&buf[0];
+          const unsigned char* p=base+bufptr;
+          const unsigned char* pend=base+buflen;
+          const int64_t room=MAX_FRAGMENT-sz;
+          assert(room>0);
+          if (pend-p>room) pend=p+room;
+          bool boundary=false;
+          while (p<pend) {
+            c=*p++;
             if (c==o1[c1]) h=(h+c+1)*314159265u, ++hits;
             else h=(h+c+1)*271828182u;
             o1[c1]=c;
             c1=c;
-            sha1.put(c);
             fragbuf[sz++]=c;
+            if (h<hmin && sz>=MIN_FRAGMENT) {
+              boundary=true;
+              break;
+            }
           }
-          if (c==EOF
-              || sz>=MAX_FRAGMENT
-              || (fragment<=22 && h<(1u<<(22-fragment)) && sz>=MIN_FRAGMENT))
-            break;
+          bufptr=p-base;
+          if (boundary || sz>=MAX_FRAGMENT) break;
         }
         assert(sz<=MAX_FRAGMENT);
         total_done+=sz;
 
         // Look for matching fragment
+        libzpaq::SHA1 sha1;
+        sha1.write(&fragbuf[0], sz);
         assert(uint64_t(sz)==sha1.usize());
         memcpy(sha1result, sha1.result(), 20);
         htptr=htinv.find(sha1result);
