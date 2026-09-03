@@ -67,6 +67,7 @@ Possible options:
 #include <string>
 #include <vector>
 #include <map>
+#include <set>
 #include <algorithm>
 #include <stdexcept>
 #include <fcntl.h>
@@ -549,21 +550,49 @@ void ioerr(const char* msg) {
   throw std::runtime_error(msg);
 }
 
+// Thread safe set of directories already created by makepath(), so that
+// extracting many files to the same directory does not repeat the
+// (slow, especially in Windows) system calls for each file.
+class DirCache {
+  Mutex mutex;
+  std::set<string> dirs;
+public:
+  DirCache() {init_mutex(mutex);}
+  ~DirCache() {destroy_mutex(mutex);}
+
+  // Create the directories in path up to the last / or \ unless they
+  // were already created by an earlier call. For example if
+  // path="/tmp/foo/bar" then create /, /tmp and /tmp/foo. The lock is
+  // held while creating so that no thread can see a directory as
+  // created before it exists.
+  void makedirs(string path) {
+    const size_t slash=path.find_last_of("\\/");
+    if (slash==string::npos) return;
+    lock(mutex);
+    if (dirs.find(path.substr(0, slash))==dirs.end()) {
+      for (size_t i=0; i<=slash; ++i) {
+        if (path[i]=='\\' || path[i]=='/') {
+          path[i]=0;
+          if (dirs.insert(path.c_str()).second) {
+#ifdef unix
+            mkdir(path.c_str(), 0777);
+#else
+            CreateDirectory(utow(path.c_str()).c_str(), 0);
+#endif
+          }
+          path[i]='/';
+        }
+      }
+    }
+    release(mutex);
+  }
+} dirCache;
+
 // Create directories as needed. For example if path="/tmp/foo/bar"
 // then create directories /, /tmp, and /tmp/foo unless they exist.
 // Set date and attributes if not 0.
 void makepath(string path, int64_t date=0, int64_t attr=0) {
-  for (unsigned i=0; i<path.size(); ++i) {
-    if (path[i]=='\\' || path[i]=='/') {
-      path[i]=0;
-#ifdef unix
-      mkdir(path.c_str(), 0777);
-#else
-      CreateDirectory(utow(path.c_str()).c_str(), 0);
-#endif
-      path[i]='/';
-    }
-  }
+  dirCache.makedirs(path);
 
   // Set date and attributes
   string filename=path;
@@ -2773,22 +2802,26 @@ bool Jidac::equal(DTMap::const_iterator p, const char* filename) {
 
 struct ExtractJob {         // list of jobs
   Mutex mutex;              // protects state
-  Mutex write_mutex;        // protects writing to disk
+  enum {NFILEMUTEX=64};     // number of output file locks
+  Mutex file_mutex[NFILEMUTEX];  // each protects a subset of output files
   int job;                  // number of jobs started
   Jidac& jd;                // what to extract
-  FP outf;                  // currently open output file
-  DTMap::iterator lastdt;   // currently open output file name
   double maxMemory;         // largest memory used by any block (test mode)
   int64_t total_size;       // bytes to extract
   int64_t total_done;       // bytes extracted so far
-  ExtractJob(Jidac& j): job(0), jd(j), outf(FPNULL), lastdt(j.dt.end()),
+  ExtractJob(Jidac& j): job(0), jd(j),
       maxMemory(0), total_size(0), total_done(0) {
     init_mutex(mutex);
-    init_mutex(write_mutex);
+    for (int i=0; i<NFILEMUTEX; ++i) init_mutex(file_mutex[i]);
   }
   ~ExtractJob() {
+    for (int i=0; i<NFILEMUTEX; ++i) destroy_mutex(file_mutex[i]);
     destroy_mutex(mutex);
-    destroy_mutex(write_mutex);
+  }
+
+  // Return the lock that protects writing to output file p
+  Mutex& fileMutex(DTMap::iterator p) {
+    return file_mutex[(size_t(&p->second)>>6)%NFILEMUTEX];
   }
 };
 
@@ -2924,41 +2957,36 @@ ThreadReturn decompressThread(void* arg) {
       continue;
     }
 
-    // Write the files in dt that point to this block
-    lock(job.write_mutex);
+    // Write the files in dt that point to this block. Different threads
+    // write different blocks in parallel. A file is locked while its
+    // fragments from this block are written so that two threads never
+    // have the same file open at once when a file spans several blocks.
     for (unsigned ip=0; ip<b.files.size(); ++ip) {
       DTMap::iterator p=b.files[ip];
+      Mutex& fmutex=job.fileMutex(p);
+      lock(fmutex);
       if (p->second.date==0 || p->second.data<0
-          || p->second.data>=int64_t(p->second.ptr.size()))
+          || p->second.data>=int64_t(p->second.ptr.size())) {
+        release(fmutex);
         continue;  // don't write
+      }
 
       // Look for pointers to this block
       const vector<unsigned>& ptr=p->second.ptr;
-      int64_t offset=0;  // write offset
+      const string filename=job.jd.rename(p->first);
+      FP outf=FPNULL;     // output file
+      bool opened=false;  // output file open attempted?
+      int64_t offset=0;   // write offset
       for (unsigned j=0; j<ptr.size(); ++j) {
         if (ptr[j]<b.start || ptr[j]>=b.start+b.extracted) {
           offset+=job.jd.ht[ptr[j]].usize;
           continue;
         }
 
-        // Close last opened file if different
-        if (p!=job.lastdt) {
-          if (job.outf!=FPNULL) {
-            assert(job.lastdt!=job.jd.dt.end());
-            assert(job.lastdt->second.date);
-            assert(job.lastdt->second.data
-                   <int64_t(job.lastdt->second.ptr.size()));
-            fclose(job.outf);
-            job.outf=FPNULL;
-          }
-          job.lastdt=job.jd.dt.end();
-        }
-
-        // Open file for output
-        if (job.lastdt==job.jd.dt.end()) {
-          string filename=job.jd.rename(p->first);
-          assert(job.outf==FPNULL);
-          if (p->second.data==0) {
+        // Open file for output at the first fragment found in this block
+        if (!opened) {
+          opened=true;
+          if (p->second.data==0) {  // new file
             if (!job.jd.dotest) makepath(filename);
             if (job.jd.summary<=0) {
               lock(job.mutex);
@@ -2971,8 +2999,8 @@ ThreadReturn decompressThread(void* arg) {
               release(job.mutex);
             }
             if (!job.jd.dotest) {
-              job.outf=fopen(filename.c_str(), WB);
-              if (job.outf==FPNULL) {
+              outf=fopen(filename.c_str(), WB);
+              if (outf==FPNULL) {
                 lock(job.mutex);
                 printerr(filename.c_str());
                 release(job.mutex);
@@ -2980,7 +3008,7 @@ ThreadReturn decompressThread(void* arg) {
 #ifndef unix
               else if ((p->second.attr&0x200ff)==0x20000+'w') {  // sparse?
                 DWORD br=0;
-                if (!DeviceIoControl(job.outf, FSCTL_SET_SPARSE,
+                if (!DeviceIoControl(outf, FSCTL_SET_SPARSE,
                     NULL, 0, NULL, 0, &br, NULL))  // set sparse attribute
                   printerr(filename.c_str());
               }
@@ -2988,12 +3016,10 @@ ThreadReturn decompressThread(void* arg) {
             }
           }
           else if (!job.jd.dotest)
-            job.outf=fopen(filename.c_str(), RBPLUS);  // update existing file
-          if (!job.jd.dotest && job.outf==FPNULL) break;  // skip errors
-          job.lastdt=p;
-          assert(job.jd.dotest || job.outf!=FPNULL);
+            outf=fopen(filename.c_str(), RBPLUS);  // update existing file
+          if (!job.jd.dotest && outf==FPNULL) break;  // skip errors
         }
-        assert(job.lastdt==p);
+        assert(job.jd.dotest || outf!=FPNULL);
 
         // Find block offset of fragment
         uint64_t q=0;  // fragment offset from start of block
@@ -3029,38 +3055,27 @@ ThreadReturn decompressThread(void* arg) {
         uint64_t nz=q;  // first nonzero byte in fragments to be written
         while (nz<q+usize && out.c_str()[nz]==0) ++nz;
         if (!job.jd.dotest && (nz<q+usize || j+1==ptr.size())) {
-          fseeko(job.outf, offset, SEEK_SET);
-          fwrite(out.c_str()+q, 1, usize, job.outf);
+          fseeko(outf, offset, SEEK_SET);
+          fwrite(out.c_str()+q, 1, usize, outf);
         }
         offset+=usize;
         lock(job.mutex);
         job.total_done+=usize;
         release(job.mutex);
-
-        // Close file. If this is the last fragment then set date and attr.
-        // Do not set read-only attribute in Windows yet.
-        if (p->second.data==int64_t(ptr.size())) {
-          assert(p->second.date);
-          assert(job.lastdt!=job.jd.dt.end());
-          assert(job.jd.dotest || job.outf!=FPNULL);
-          if (!job.jd.dotest) {
-            assert(job.outf!=FPNULL);
-            string fn=job.jd.rename(p->first);
-            int64_t attr=p->second.attr;
-            int64_t date=p->second.date;
-            if ((p->second.attr&0x1ff)=='w'+256) attr=0;  // read-only?
-            if (p->second.data!=int64_t(p->second.ptr.size()))
-              date=attr=0;  // not last frag
-            close(fn.c_str(), date, attr, job.outf);
-            job.outf=FPNULL;
-          }
-          job.lastdt=job.jd.dt.end();
-        }
       } // end for j
-    } // end for ip
 
-    // Last file
-    release(job.write_mutex);
+      // Close file. If this was the last fragment then set date and attr.
+      // Do not set read-only attribute in Windows yet.
+      if (outf!=FPNULL) {
+        int64_t attr=p->second.attr;
+        int64_t date=p->second.date;
+        if ((p->second.attr&0x1ff)=='w'+256) attr=0;  // read-only?
+        if (p->second.data!=int64_t(ptr.size()))
+          date=attr=0;  // not last frag
+        close(filename.c_str(), date, attr, outf);
+      }
+      release(fmutex);
+    } // end for ip
   } // end while true
 
   // Last block
