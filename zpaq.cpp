@@ -1154,8 +1154,8 @@ private:
 #ifndef unix
   vector<StreamScan> streamq;           // files to scan for streams
   bool scandirfast(const string& prefix);  // scan a whole directory
-  void scanentry(const string& prefix, const wchar_t* name, size_t len,
-                 DWORD attr, int64_t wtime, int64_t size, int64_t ctime);
+  void scanentry(const string& prefix, const string& name, DWORD attr,
+                 int64_t wtime, int64_t size, int64_t ctime, bool recurse);
 #endif
   void addfile(string filename, int64_t edate, int64_t esize,
                int64_t eattr);          // add external file to dt
@@ -1975,11 +1975,10 @@ void Jidac::scandir(string filename) {
       && GetLastError()!=ERROR_PATH_NOT_FOUND)
     printerr(t.c_str());
   while (h!=INVALID_HANDLE_VALUE) {
-    scanentry(prefix, ffd.cFileName, wcslen(ffd.cFileName),
-        ffd.dwFileAttributes,
+    scanentry(prefix, wtou(ffd.cFileName), ffd.dwFileAttributes,
         ffd.ftLastWriteTime.dwLowDateTime
             +(int64_t(ffd.ftLastWriteTime.dwHighDateTime)<<32),
-        ffd.nFileSizeLow+(int64_t(ffd.nFileSizeHigh)<<32), 0);
+        ffd.nFileSizeLow+(int64_t(ffd.nFileSizeHigh)<<32), 0, true);
     if (!FindNextFile(h, &ffd)) {
       if (GetLastError()!=ERROR_NO_MORE_FILES) printerr(t.c_str());
       break;
@@ -1991,49 +1990,176 @@ void Jidac::scandir(string filename) {
 
 #ifndef unix
 
-// Scan the directory prefix (ending with /) through a directory handle.
-// Return false without output if it cannot be opened, so that the
-// caller falls back to FindFirstFileEx and reports the error.
-bool Jidac::scandirfast(const string& prefix) {
-  string d=prefix;
-  if (d.size()>3 && d[d.size()-1]=='/') d.erase(d.size()-1);  // keep C:/
-  HANDLE h=CreateFile(utow(d.c_str()).c_str(), FILE_LIST_DIRECTORY,
+// A DirJob reads whole directories in parallel through directory
+// handles. Each thread takes a directory from the queue, reads its
+// entries with GetFileInformationByHandleEx(FileFullDirectoryInfo) in
+// 64 KB chunks and queues its subdirectories. The main thread adds the
+// entries to dt afterwards, directory by directory in name order.
+struct DirJob {
+  struct Entry {  // one directory entry
+    string name;    // UTF-8
+    DWORD attr;
+    int64_t wtime, size, ctime;  // FILETIME, bytes, FILETIME
+  };
+  struct Result {  // one directory read
+    string prefix;  // directory name ending with /
+    DWORD err;      // error code, or ERROR_NO_MORE_FILES if all read
+    vector<Entry> entries;
+  };
+  Mutex mutex;              // protects everything below
+  Semaphore work;           // queued directories, or stop tokens
+  vector<string> queue;     // directories to read, ending with /
+  unsigned pending;         // directories queued or being read
+  bool done;                // no more work: threads exit
+  unsigned nt;              // number of threads
+  const vector<string>& notfiles;  // -not: directories to skip
+  vector<Result> results;
+  DirJob(unsigned nt_, const vector<string>& nf):
+      pending(0), done(false), nt(nt_), notfiles(nf) {
+    init_mutex(mutex);
+    work.init(0);
+  }
+  ~DirJob() {
+    work.destroy();
+    destroy_mutex(mutex);
+  }
+};
+
+// Read the directory d (ending with /) into r
+static void readdirectory(const string& d, DirJob::Result& r) {
+  r.prefix=d;
+  r.err=NO_ERROR;
+  string t=d;
+  if (t.size()>3 && t[t.size()-1]=='/') t.erase(t.size()-1);  // keep C:/
+  HANDLE h=CreateFile(utow(t.c_str()).c_str(), FILE_LIST_DIRECTORY,
       FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE, NULL,
       OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
-  if (h==INVALID_HANDLE_VALUE) return false;
+  if (h==INVALID_HANDLE_VALUE) {
+    r.err=GetLastError();
+    return;
+  }
   vector<char> buf(1<<16);
   bool first=true;
-  DWORD err=NO_ERROR;
   while (true) {
     if (!getFileInformationByHandleEx(h, first ? 15 : 14, &buf[0],
         buf.size())) {  // FileFullDirectory[Restart]Info
-      err=GetLastError();
+      r.err=GetLastError();
       break;
     }
     first=false;
     for (const char* p=&buf[0];;) {
       const FullDirInfo* e=(const FullDirInfo*)p;
-      scanentry(prefix, e->FileName, e->FileNameLength/2, e->FileAttributes,
-          e->LastWriteTime.QuadPart, e->EndOfFile.QuadPart,
-          e->ChangeTime.QuadPart);
+      r.entries.resize(r.entries.size()+1);
+      DirJob::Entry& en=r.entries.back();
+      en.name=wtou(std::wstring(e->FileName, e->FileNameLength/2).c_str());
+      en.attr=e->FileAttributes;
+      en.wtime=e->LastWriteTime.QuadPart;
+      en.size=e->EndOfFile.QuadPart;
+      en.ctime=e->ChangeTime.QuadPart;
       if (!e->NextEntryOffset) break;
       p+=e->NextEntryOffset;
     }
   }
   CloseHandle(h);
-  if (err!=ERROR_NO_MORE_FILES) {
-    SetLastError(err);
-    printerr(prefix.c_str());
+}
+
+// Read directories from the queue until done
+ThreadReturn dirThread(void* arg) {
+  DirJob& job=*(DirJob*)arg;
+  while (true) {
+    job.work.wait();
+    lock(job.mutex);
+    if (job.done) {
+      release(job.mutex);
+      return 0;
+    }
+    assert(job.queue.size()>0);
+    const string d=job.queue.back();
+    job.queue.pop_back();
+    release(job.mutex);
+    DirJob::Result r;
+    readdirectory(d, r);
+    lock(job.mutex);
+    for (unsigned i=0; i<r.entries.size(); ++i) {  // queue subdirectories
+      const DirJob::Entry& e=r.entries[i];
+      if ((e.attr & FILE_ATTRIBUTE_DIRECTORY)
+          && !(e.attr & FILE_ATTRIBUTE_REPARSE_POINT)
+          && e.name!="." && e.name!="..") {
+        const string sub=d+e.name+"/";
+        bool skip=false;  // excluded by -not, like scandir(sub+"*")
+        for (unsigned j=0; j<job.notfiles.size() && !skip; ++j)
+          if (ispath(job.notfiles[j].c_str(), (sub+"*").c_str())) skip=true;
+        if (!skip) {
+          job.queue.push_back(sub);
+          ++job.pending;
+          job.work.signal();
+        }
+      }
+    }
+    job.results.resize(job.results.size()+1);
+    job.results.back().prefix.swap(r.prefix);
+    job.results.back().err=r.err;
+    job.results.back().entries.swap(r.entries);
+    if (--job.pending==0) {
+      job.done=true;
+      for (unsigned i=0; i<job.nt; ++i) job.work.signal();
+    }
+    release(job.mutex);
+  }
+  return 0;
+}
+
+// Order directories by name
+bool compareResult(const DirJob::Result& a, const DirJob::Result& b) {
+  return a.prefix<b.prefix;
+}
+
+// Scan the directory prefix (ending with /) and its subdirectories in
+// parallel through directory handles. Return false without output if
+// prefix cannot be opened, so that the caller falls back to
+// FindFirstFileEx and reports the error.
+bool Jidac::scandirfast(const string& prefix) {
+  string t=prefix;
+  if (t.size()>3 && t[t.size()-1]=='/') t.erase(t.size()-1);  // keep C:/
+  HANDLE h=CreateFile(utow(t.c_str()).c_str(), FILE_LIST_DIRECTORY,
+      FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE, NULL,
+      OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+  if (h==INVALID_HANDLE_VALUE) return false;
+  CloseHandle(h);
+
+  // Read all directories
+  unsigned nt=threads>0 ? threads : 1;
+  if (nt>32) nt=32;
+  DirJob job(nt, notfiles);
+  job.queue.push_back(prefix);
+  job.pending=1;
+  job.work.signal();
+  vector<ThreadID> tid(nt);
+  for (unsigned i=0; i<nt; ++i) run(tid[i], dirThread, &job);
+  for (unsigned i=0; i<nt; ++i) join(tid[i]);
+
+  // Add the entries in directory order
+  std::sort(job.results.begin(), job.results.end(), compareResult);
+  for (unsigned i=0; i<job.results.size(); ++i) {
+    const DirJob::Result& r=job.results[i];
+    for (unsigned j=0; j<r.entries.size(); ++j) {
+      const DirJob::Entry& e=r.entries[j];
+      scanentry(r.prefix, e.name, e.attr, e.wtime, e.size, e.ctime, false);
+    }
+    if (r.err!=ERROR_NO_MORE_FILES) {
+      SetLastError(r.err);
+      printerr(r.prefix.c_str());
+    }
   }
   return true;
 }
 
-// Add to dt the entry name[0..len-1] of directory prefix (ending with /)
-// with attributes attr, write time wtime (FILETIME), size and change
-// time ctime (FILETIME, 0 if unknown). Scan the contents of a
+// Add to dt the entry name of directory prefix (ending with /) with
+// attributes attr, write time wtime (FILETIME), size and change time
+// ctime (FILETIME, 0 if unknown). If recurse, scan the contents of a
 // directory. Queue a file for alternate stream enumeration.
-void Jidac::scanentry(const string& prefix, const wchar_t* name,
-    size_t len, DWORD attr, int64_t wtime, int64_t size, int64_t ctime) {
+void Jidac::scanentry(const string& prefix, const string& name,
+    DWORD attr, int64_t wtime, int64_t size, int64_t ctime, bool recurse) {
 
   // Get date, attributes
   SYSTEMTIME st;
@@ -2047,19 +2173,20 @@ void Jidac::scanentry(const string& prefix, const wchar_t* name,
   const int64_t eattr='w'+(int64_t(attr)<<8);
 
   // Ignore links, the names "." and ".." or any unselected file
-  const string t=wtou(std::wstring(name, len).c_str());
   if (attr & FILE_ATTRIBUTE_REPARSE_POINT
-      || t=="." || t=="..") edate=0;  // don't add
+      || name=="." || name=="..") edate=0;  // don't add
   if (!edate) return;
-  string fn=prefix+t;
+  string fn=prefix+name;
 
   // Save directory names with a trailing / and scan their contents
   // Otherwise, save plain files
   if (attr & FILE_ATTRIBUTE_DIRECTORY) {
     fn+="/";
     addfile(fn, edate, size, eattr);
-    fn+="*";
-    scandir(fn);
+    if (recurse) {
+      fn+="*";
+      scandir(fn);
+    }
   }
   else {
     addfile(fn, edate, size, eattr);
