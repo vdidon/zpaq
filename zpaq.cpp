@@ -2933,9 +2933,17 @@ int Jidac::add() {
   wp.a=&out;
   if (index) wp.b=&outi;
   writeJidacHeader(&outi, date, 0, htsize);
+  int64_t cdatasize=out.tell()-header_end;
+
+  // Compress the fragment tables, the deleted names and the index in the
+  // background, written in order. The blocks are small (16 KB) and the
+  // model set up by compressBlock costs more than the data itself, so a
+  // large index used to take seconds in this thread.
+  CompressJob ijob(threads, tid.size(), &wp);
+  for (unsigned i=0; i<tid.size(); ++i) run(tid[i], compressThread, &ijob);
+  run(wid, writeThread, &ijob);
 
   // Append compressed fragment tables to archive
-  int64_t cdatasize=out.tell()-header_end;
   StringBuffer is;
   assert(blocklist.size()==job.csize.size());
   blocklist.push_back(ht.size());
@@ -2946,10 +2954,9 @@ int Jidac::add() {
         is.write((const char*)ht[j].sha1, 20);
         puti(is, ht[j].usize, 4);
       }
-      libzpaq::compressBlock(&is, &wp, "0",
-          ("jDC"+itos(date, 14)+"h"+itos(blocklist[i], 10)).c_str(),
-          "jDC\x01");
-      is.resize(0);
+      ijob.write(is, ("jDC"+itos(date, 14)+"h"+itos(blocklist[i], 10)).c_str(),
+                 "0");
+      assert(is.size()==0);
     }
   }
 
@@ -2968,9 +2975,9 @@ int Jidac::add() {
       }
       ++removed;
       if (is.size()>16000) {
-        libzpaq::compressBlock(&is, &wp, "1",
-            ("jDC"+itos(date)+"i"+itos(++dtcount, 10)).c_str(), "jDC\x01");
-        is.resize(0);
+        ijob.write(is, ("jDC"+itos(date)+"i"+itos(++dtcount, 10)).c_str(),
+                   "1");
+        assert(is.size()==0);
       }
     }
   }
@@ -3016,12 +3023,17 @@ int Jidac::add() {
       }
     }
     if (is.size()>16000 || (is.size()>0 && p==edt.end())) {
-      libzpaq::compressBlock(&is, &wp, "1",
-          ("jDC"+itos(date)+"i"+itos(++dtcount, 10)).c_str(), "jDC\x01");
-      is.resize(0);
+      ijob.write(is, ("jDC"+itos(date)+"i"+itos(++dtcount, 10)).c_str(),
+                 "1");
+      assert(is.size()==0);
     }
     if (p==edt.end()) break;
   }
+
+  // Wait for the index blocks to be written
+  ijob.write(is, 0, "");  // signal end of input
+  for (unsigned i=0; i<tid.size(); ++i) join(tid[i]);
+  join(wid);
   printf("%d +added, %d -removed.\n", added, removed);
   assert(is.size()==0);
 
