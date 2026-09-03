@@ -274,18 +274,28 @@ void printUTF8(const char* s, FILE* f=stdout) {
   assert(f);
   assert(s);
 #ifdef unix
-  fprintf(f, "%s", s);
+  fputs(s, f);
 #else
-  const HANDLE h=(HANDLE)_get_osfhandle(_fileno(f));
-  DWORD ft=GetFileType(h);
-  if (ft==FILE_TYPE_CHAR) {
+  // Is f a console? Tested once per standard stream: the test is a
+  // system call and the answer does not change. NUL is not a console.
+  static int isout=-1, iserr=-1;  // 1 if a console, 0 if not, -1 unknown
+  int* is=f==stdout ? &isout : f==stderr ? &iserr : 0;
+  int c;
+  if (is && *is>=0) c=*is;
+  else {
+    DWORD mode=0;
+    c=GetConsoleMode((HANDLE)_get_osfhandle(_fileno(f)), &mode)!=0;
+    if (is) *is=c;
+  }
+  if (c) {
     fflush(f);
     std::wstring w=utow(s, '/');  // Windows console: convert to UTF-16
     DWORD n=0;
-    WriteConsole(h, w.c_str(), w.size(), &n, 0);
+    WriteConsole((HANDLE)_get_osfhandle(_fileno(f)), w.c_str(), w.size(),
+                 &n, 0);
   }
-  else  // stdout redirected to file
-    fprintf(f, "%s", s);
+  else  // redirected to a file, pipe or NUL: buffered
+    fputs(s, f);
 #endif
 }
 
@@ -1958,15 +1968,32 @@ inline void puti(libzpaq::StringBuffer& sb, uint64_t x, int n) {
   for (; n>0; --n) sb.put(x&255), x>>=8;
 }
 
-// Print percent done (td/ts) and estimated time remaining
-void print_progress(int64_t ts, int64_t td, int sum) {
+// Return percent done (td/ts) and estimated time remaining,
+// or "" if less than 1 MB is done
+string progress(int64_t ts, int64_t td) {
   if (td>ts) td=ts;
-  if (td>=1000000) {
-    double eta=0.001*(mtime()-global_start)*(ts-td)/(td+1.0);
-    printf("%5.2f%% %d:%02d:%02d ", td*100.0/(ts+0.5),
-       int(eta/3600), int(eta/60)%60, int(eta)%60);
-    if (sum>0) printf("\r"), fflush(stdout);
+  if (td<1000000) return "";
+  double eta=0.001*(mtime()-global_start)*(ts-td)/(td+1.0);
+  char buf[128];
+  sprintf(buf, "%5.2f%% %d:%02d:%02d ", td*100.0/(ts+0.5),
+      int(eta/3600), int(eta/60)%60, int(eta)%60);
+  return buf;
+}
+
+// Print percent done (td/ts) and estimated time remaining. If sum>0
+// then overwrite the line, and only when the text changed.
+void print_progress(int64_t ts, int64_t td, int sum) {
+  string s=progress(ts, td);
+  if (s=="") return;
+  if (sum>0) {
+    static string last;  // callers hold a lock when multithreaded
+    if (s==last) return;
+    last=s;
+    s+="\r";
+    fputs(s.c_str(), stdout);
+    fflush(stdout);
   }
+  else fputs(s.c_str(), stdout);
 }
 
 // A CompressJob is a queue of blocks to compress and write to the archive.
@@ -2517,6 +2544,7 @@ int Jidac::add() {
   else printf("Creating ");
   printUTF8(arcname.c_str());
   printf(" at offset %1.0f + %1.0f\n", double(header_pos), double(offset));
+  fflush(stdout);
 
   // Set method
   if (method=="") method="1";
@@ -2602,6 +2630,7 @@ int Jidac::add() {
       "Adding %1.6f MB in %d files -method %s -threads %d at %s.\n",
       total_size/1000000.0, int(vf.size()), method.c_str(), threads,
       dateToString(date).c_str());
+  fflush(stdout);
   for (unsigned i=0; i<tid.size(); ++i) run(tid[i], compressThread, &job);
   run(wid, writeThread, &job);
 
@@ -2900,21 +2929,24 @@ int Jidac::add() {
     if (rd && !skipped) {
       dedupesize+=fsize;
       DTMap::iterator p=vf[fi];
-      print_progress(total_size, total_done, summary);
-      if (summary<=0) {
+      if (summary<=0) {  // one line per file, written in one call
+        string line=progress(total_size, total_done);
         string newname=rename(p->first.c_str());
         DTMap::iterator a=dt.find(newname);
-        if (a==dt.end() || a->second.date==0) printf("+ ");
-        else printf("# ");
-        printUTF8(p->first.c_str());
-        if (newname!=p->first) {
-          printf(" -> ");
-          printUTF8(newname.c_str());
+        line+=(a==dt.end() || a->second.date==0) ? "+ " : "# ";
+        line+=p->first;
+        if (newname!=p->first) line+=" -> "+newname;
+        char buf[64];
+        sprintf(buf, " %1.0f", p->second.size+0.0);
+        line+=buf;
+        if (fsize!=p->second.size) {
+          sprintf(buf, " -> %1.0f", fsize+0.0);
+          line+=buf;
         }
-        printf(" %1.0f", p->second.size+0.0);
-        if (fsize!=p->second.size) printf(" -> %1.0f", fsize+0.0);
-        printf("\n");
+        line+="\n";
+        printUTF8(line.c_str());
       }
+      else print_progress(total_size, total_done, summary);
     }
   }  // end for each file fi
   assert(sb.size()==0);
@@ -3373,14 +3405,13 @@ ThreadReturn decompressThread(void* arg) {
           opened=true;
           if (p->second.data==0) {  // new file
             if (!job.jd.dotest) makepath(filename);
-            if (job.jd.summary<=0) {
+            if (job.jd.summary<=0) {  // one line, written in one call
               lock(job.mutex);
-              print_progress(job.total_size, job.total_done, job.jd.summary);
-              if (job.jd.summary<=0) {
-                printf("> ");
-                printUTF8(filename.c_str());
-                printf("\n");
-              }
+              string line=progress(job.total_size, job.total_done);
+              line+="> ";
+              line+=filename;
+              line+="\n";
+              printUTF8(line.c_str());
               release(job.mutex);
             }
             if (!job.jd.dotest) {
@@ -3772,6 +3803,7 @@ int Jidac::extract() {
   // Decompress archive in parallel
   printf("Extracting %1.6f MB in %d files -threads %d\n",
       job.total_size/1000000.0, total_files, threads);
+  fflush(stdout);
   vector<ThreadID> tid(threads);
   for (unsigned i=0; i<tid.size(); ++i) run(tid[i], decompressThread, &job);
 
@@ -4122,6 +4154,12 @@ int main() {
     argp[i]=args[i].c_str();
   }
   const char** argv=&argp[0];
+
+  // Buffer stdout: the C runtime leaves a console or NUL unbuffered, so
+  // each printf would be a system call. Text meant for a console is
+  // written by printUTF8, which flushes first; the other lines are
+  // flushed by the operations before waiting or exiting.
+  setvbuf(stdout, 0, _IOFBF, 1<<16);
 #endif
 
   global_start=mtime();  // get start time
