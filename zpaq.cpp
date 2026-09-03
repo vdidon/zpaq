@@ -209,11 +209,11 @@ void run(ThreadID& tid, ThreadReturn(*f)(void*), void* arg) {
   if (tid==NULL) error("CreateThread failed");
 }
 void join(ThreadID& tid) {WaitForSingleObject(tid, INFINITE);}
-typedef HANDLE Mutex;
-void init_mutex(Mutex& m) {m=CreateMutex(NULL, FALSE, NULL);}
-void lock(Mutex& m) {WaitForSingleObject(m, INFINITE);}
-void release(Mutex& m) {ReleaseMutex(m);}
-void destroy_mutex(Mutex& m) {CloseHandle(m);}
+typedef CRITICAL_SECTION Mutex;  // user mode unless contended
+void init_mutex(Mutex& m) {InitializeCriticalSection(&m);}
+void lock(Mutex& m) {EnterCriticalSection(&m);}
+void release(Mutex& m) {LeaveCriticalSection(&m);}
+void destroy_mutex(Mutex& m) {DeleteCriticalSection(&m);}
 
 class Semaphore {
 public:
