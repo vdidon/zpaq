@@ -19,7 +19,7 @@ zpaq.cpp        7.15   zpaq source code.
 zpaq.pod        7.12   zpaq man page in pod2man format.
 libzpaq.h       7.12   libzpaq API documentation and header.
 libzpaq.cpp     7.15   libzpaq API source code.
-Makefile               To compile in Linux: make {install|check|clean}
+Makefile               To compile with GNU make: make {install|check|clean}
 COPYING                Unlicense.
 
 All versions of this software can be found at
