@@ -50,6 +50,15 @@ See libzpaq.h for additional documentation.
 #define ZPAQ_PREFETCH(p) ((void)0)
 #endif
 
+// SSE2 is used to test a row of the LZ77 hash table at once
+#if defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64)
+#define ZPAQ_LZ_SSE2 1
+#include <emmintrin.h>
+#elif defined(_M_IX86_FP) && _M_IX86_FP>=2
+#define ZPAQ_LZ_SSE2 1
+#include <emmintrin.h>
+#endif
+
 // SHA-1 hardware acceleration using x86 SHA extensions, selected at run
 // time if the CPU supports it. Requires g++ 5 or later, clang, or
 // Visual Studio 2017 or later. Compile with -DNOSHANI to disable.
@@ -6829,6 +6838,41 @@ void e8e9(unsigned char* buf, int n) {
   }
 }
 
+// Number of trailing zero bits of x>0
+static inline unsigned ctz32(unsigned x) {
+  assert(x);
+#if defined(__GNUC__) || defined(__clang__)
+  return __builtin_ctz(x);
+#elif defined(_MSC_VER)
+  unsigned long k;
+  _BitScanForward(&k, x);
+  return k;
+#else
+  unsigned k=0;
+  while (!(x&1)) x>>=1, ++k;
+  return k;
+#endif
+}
+
+#ifdef ZPAQ_LZ_SSE2
+// Return a bit for each of the 8 hash table entries row[0..7] that is
+// not empty and whose low bits under mask are equal to cb.
+static inline unsigned rowMatches(const unsigned* row, unsigned mask,
+                                  unsigned cb) {
+  const __m128i vz=_mm_setzero_si128();
+  const __m128i vmask=_mm_set1_epi32(mask);
+  const __m128i vcb=_mm_set1_epi32(cb);
+  const __m128i m0=_mm_loadu_si128((const __m128i*)row);
+  const __m128i m1=_mm_loadu_si128((const __m128i*)(row+4));
+  const __m128i e0=_mm_andnot_si128(_mm_cmpeq_epi32(m0, vz),
+      _mm_cmpeq_epi32(_mm_and_si128(m0, vmask), vcb));
+  const __m128i e1=_mm_andnot_si128(_mm_cmpeq_epi32(m1, vz),
+      _mm_cmpeq_epi32(_mm_and_si128(m1, vmask), vcb));
+  return _mm_movemask_ps(_mm_castsi128_ps(e0))
+      |(_mm_movemask_ps(_mm_castsi128_ps(e1))<<4);
+}
+#endif
+
 // Encode inbuf to buf using LZ77. args are as follows:
 // args[0] is log2 buffer size in MB.
 // args[1] is level (1=var. length, 2=byte aligned lz77, 3=bwt) + 4 if E8E9.
@@ -6856,13 +6900,15 @@ class LZBuffer: public libzpaq::Reader {
   const unsigned lookahead;   // second context look ahead
   unsigned h1, h2;            // low, high order context hashes of in[i..]
   unsigned h1p, h2p;          // same hashes PREFETCH_DIST positions ahead
-  enum {PREFETCH_DIST=8};     // prefetch distance for ht lookups
+  enum {PREFETCH_DIST=32};    // prefetch distance for ht lookups
+  enum {CAND_DIST=8};         // prefetch distance for match candidates
+  unsigned hring[PREFETCH_DIST];  // h1 of the coming positions, by position
   const unsigned bucket;      // number of matches to search per hash - 1
   const unsigned shift1, shift2;  // how far to shift h1, h2 per hash
   const int minMatchBoth;     // max(minMatch, minMatch2)
   const unsigned rb;          // number of level 1 r bits in match code
-  unsigned bits;              // pending output bits (level 1)
-  unsigned nbits;             // number of bits in bits
+  U64 bits;                   // pending output bits (level 1)
+  int nbits;                  // number of bits in bits, 0..31 between calls
   unsigned rpos, wpos;        // read, write pointers
   unsigned idx;               // BWT index
   const unsigned* sa;         // suffix array for BWT or LZ77-SA
@@ -6874,21 +6920,30 @@ class LZBuffer: public libzpaq::Reader {
   void write_match(unsigned len, unsigned off);
   void fill();  // encode to buf
 
-  // write k bits of x
+  // write k bits of x, LSB first. Whole bytes are written 4 at a time.
   void putb(unsigned x, int k) {
-    x&=(1<<k)-1;
-    bits|=x<<nbits;
+    assert(k>=0 && k<=24);
+    x&=(1u<<k)-1;
+    bits|=U64(x)<<nbits;
     nbits+=k;
-    while (nbits>7) {
-      assert(wpos<BUFSIZE);
-      buf[wpos++]=bits, bits>>=8, nbits-=8;
+    if (nbits>=32) {
+      assert(wpos+4<=BUFSIZE);
+      buf[wpos]=bits;
+      buf[wpos+1]=bits>>8;
+      buf[wpos+2]=bits>>16;
+      buf[wpos+3]=bits>>24;
+      wpos+=4;
+      bits>>=32;
+      nbits-=32;
     }
   }
 
-  // write last byte
+  // write pending bytes and the last partial byte
   void flush() {
-    assert(wpos<BUFSIZE);
-    if (nbits>0) buf[wpos++]=bits;
+    while (nbits>0) {
+      assert(wpos<BUFSIZE);
+      buf[wpos++]=bits, bits>>=8, nbits-=8;
+    }
     bits=nbits=0;
   }
 
@@ -6937,6 +6992,12 @@ public:
 
 // floor(log2(x)) + 1 = number of bits excluding leading zeros (0..32)
 int lg(unsigned x) {
+#if defined(__GNUC__) || defined(__clang__)
+  return x ? 32-__builtin_clz(x) : 0;
+#elif defined(_MSC_VER)
+  unsigned long k;
+  return _BitScanReverse(&k, x) ? int(k)+1 : 0;
+#else
   unsigned r=0;
   if (x>=65536) r=16, x>>=16;
   if (x>=256) r+=8, x>>=8;
@@ -6944,6 +7005,7 @@ int lg(unsigned x) {
   assert(x>=0 && x<16);
   return
     "\x00\x01\x02\x02\x03\x03\x03\x03\x04\x04\x04\x04\x04\x04\x04\x04"[x]+r;
+#endif
 }
 
 // return number of 1 bits in x
@@ -6989,6 +7051,7 @@ LZBuffer::LZBuffer(StringBuffer& inbuf, int args[], const unsigned* sap):
     rb(args[0]>4 ? args[0]-4 : 0),
     bits(0), nbits(0), rpos(0), wpos(0),
     idx(0), sa(0), isa(0) {
+  memset(hring, 0, sizeof(hring));
   assert(args[0]>=0);
   assert(n<=(1u<<20<<args[0]));
   assert(args[1]>=1 && args[1]<=7 && args[1]!=4);
@@ -7063,63 +7126,70 @@ void LZBuffer::fill() {
     return;
   }
 
-  // LZ77: scan the input
+  // LZ77: scan the input. The loop state and the parameters are kept in
+  // local variables: stores into ht could alias the members otherwise.
+  const unsigned char* const inp=in;
+  unsigned* const htp=&ht[0];
+  const unsigned nn=n, mm=minMatch, mm2=minMatch2, mmb=minMatchBoth;
+  const unsigned bk=bucket, cbits=checkbits, sh1=shift1, sh2=shift2;
+  const unsigned hts=htsize, la=lookahead, maxm=maxMatch, maxl=maxLiteral;
+  unsigned ii=i, hh1=h1, hh2=h2, hh1p=h1p, hh2p=h2p;
   unsigned lit=0;  // number of output literals pending
-  const unsigned mask=(1<<checkbits)-1;
-  while (i<n && wpos*2<BUFSIZE) {
+  const unsigned mask=(1<<cbits)-1;
+  while (ii<nn && wpos*2<BUFSIZE) {
 
     // Search for longest match, or pick closest in case of tie
-    unsigned blen=minMatch-1;  // best match length
+    unsigned blen=mm-1;  // best match length
     unsigned bp=0;  // pointer to best match
     unsigned blit=0;  // literals before best match
     int bscore=0;  // best cost
 
     // Look up contexts in suffix array
     if (isa) {
-      if (sa[isa[i&mask]]!=i) // rebuild ISA
-        for (unsigned j=0; j<n; ++j)
-          if ((sa[j]&~mask)==(i&~mask))
+      if (sa[isa[ii&mask]]!=ii) // rebuild ISA
+        for (unsigned j=0; j<nn; ++j)
+          if ((sa[j]&~mask)==(ii&~mask))
             isa[sa[j]&mask]=j;
-      for (unsigned h=0; h<=lookahead; ++h) {
-        unsigned q=isa[(h+i)&mask];  // location of h+i in SA
-        assert(q<n);
-        if (sa[q]!=h+i) continue;
+      for (unsigned h=0; h<=la; ++h) {
+        unsigned q=isa[(h+ii)&mask];  // location of h+ii in SA
+        assert(q<nn);
+        if (sa[q]!=h+ii) continue;
         for (int j=-1; j<=1; j+=2) {  // search backward and forward
-          for (unsigned k=1; k<=bucket; ++k) {
+          for (unsigned k=1; k<=bk; ++k) {
             unsigned p;  // match to be tested
-            if (q+j*k<n && (p=sa[q+j*k]-h)<i) {
-              assert(p<n);
+            if (q+j*k<nn && (p=sa[q+j*k]-h)<ii) {
+              assert(p<nn);
               unsigned l, l1;  // length of match, leading literals
-              l=matchLength(in+p, in+i, h, MIN(maxMatch, n-i));
-              for (l1=h; l1>0 && in[p+l1-1]==in[i+l1-1]; --l1);
-              int score=int(l-l1)*8-lg(i-p)-4*(lit==0 && l1>0)-11;
+              l=matchLength(inp+p, inp+ii, h, MIN(maxm, nn-ii));
+              for (l1=h; l1>0 && inp[p+l1-1]==inp[ii+l1-1]; --l1);
+              int score=int(l-l1)*8-lg(ii-p)-4*(lit==0 && l1>0)-11;
               for (unsigned a=0; a<h; ++a) score=score*5/8;
               if (score>bscore) blen=l, bp=p, blit=l1, bscore=score;
-              if (l<blen || l<minMatch || l>255) break;
+              if (l<blen || l<mm || l>255) break;
             }
           }
         }
-        if (bscore<=0 || blen<minMatch) break;
+        if (bscore<=0 || blen<mm) break;
       }
     }
 
     // Look up contexts in a hash table.
     // Try the longest context orders first. If a match is found, then
     // skip the lower order as a speed optimization.
-    else if (level==1 || minMatch<=64) {
-      if (minMatch2>0) {
-        for (unsigned k=0; k<=bucket; ++k) {
-          unsigned p=ht[h2^k];
-          if (p && (p&mask)==(in[i+3]&mask)) {
-            p>>=checkbits;
-            if (p<i && i+blen<=n && in[p+blen-1]==in[i+blen-1]) {
+    else if (level==1 || mm<=64) {
+      if (mm2>0) {
+        for (unsigned k=0; k<=bk; ++k) {
+          unsigned p=htp[hh2^k];
+          if (p && (p&mask)==(inp[ii+3]&mask)) {
+            p>>=cbits;
+            if (p<ii && ii+blen<=nn && inp[p+blen-1]==inp[ii+blen-1]) {
               unsigned l;  // match length from lookahead
-              l=matchLength(in+p, in+i, lookahead, MIN(maxMatch, n-i));
-              if (l>=minMatch2+lookahead) {
+              l=matchLength(inp+p, inp+ii, la, MIN(maxm, nn-ii));
+              if (l>=mm2+la) {
                 int l1;  // length back from lookahead
-                for (l1=lookahead; l1>0 && in[p+l1-1]==in[i+l1-1]; --l1);
-                assert(l1>=0 && l1<=int(lookahead));
-                int score=int(l-l1)*8-lg(i-p)-8*(lit==0 && l1>0)-11;
+                for (l1=la; l1>0 && inp[p+l1-1]==inp[ii+l1-1]; --l1);
+                assert(l1>=0 && l1<=int(la));
+                int score=int(l-l1)*8-lg(ii-p)-8*(lit==0 && l1>0)-11;
                 if (score>bscore) blen=l, bp=p, blit=l1, bscore=score;
               }
             }
@@ -7129,15 +7199,56 @@ void LZBuffer::fill() {
       }
 
       // Search the lower order context
-      if (!minMatch2 || blen<minMatch2) {
-        for (unsigned k=0; k<=bucket; ++k) {
-          unsigned p=ht[h1^k];
-          if (p && i+3<n && (p&mask)==(in[i+3]&mask)) {
-            p>>=checkbits;
-            if (p<i && i+blen<=n && in[p+blen-1]==in[i+blen-1]) {
+      if ((!mm2 || blen<mm2) && ii+3<nn) {
+        const unsigned cb=inp[ii+3]&mask;  // confirmation byte
+        const unsigned limit=MIN(maxm, nn-ii);
+#ifdef ZPAQ_LZ_SSE2
+        // Prefetch the input at the candidates of the position CAND_DIST
+        // ahead, whose hash table row was prefetched earlier
+        if (bk<=7 && ii+CAND_DIST+mmb<nn) {
+          const unsigned hf=hring[(ii+CAND_DIST)&(PREFETCH_DIST-1)];
+          const unsigned* rowf=htp+(hf&~7u);
+          unsigned pm=rowMatches(rowf, mask, inp[ii+CAND_DIST+3]&mask);
+          while (pm) {
+            const unsigned j=ctz32(pm);
+            pm&=pm-1;
+            ZPAQ_PREFETCH(inp+(rowf[j]>>cbits));
+          }
+        }
+        // Test the 8 entries of the aligned group holding ht[h1^0..7]
+        // at once, then visit the candidates in the order k=0..bucket
+        if (bk<=7) {
+          const unsigned r=hh1&7;
+          const unsigned* row=htp+(hh1&~7u);
+          unsigned pm=rowMatches(row, mask, cb);
+          // bit k of pm becomes the test of entry r^k, i.e. ht[h1^k]
+          if (r&1) pm=((pm&0x55)<<1)|((pm>>1)&0x55);
+          if (r&2) pm=((pm&0x33)<<2)|((pm>>2)&0x33);
+          if (r&4) pm=((pm&0x0f)<<4)|((pm>>4)&0x0f);
+          pm&=(2u<<bk)-1;
+          while (pm) {
+            const unsigned k=ctz32(pm);
+            pm&=pm-1;
+            const unsigned p=row[r^k]>>cbits;
+            assert(&row[r^k]==&htp[hh1^k]);
+            if (p<ii && ii+blen<=nn && inp[p+blen-1]==inp[ii+blen-1]) {
+              const unsigned l=matchLength(inp+p, inp+ii, 0, limit);
+              const int score=l*8-lg(ii-p)-2*(lit>0)-11;
+              if (score>bscore) blen=l, bp=p, blit=0, bscore=score;
+            }
+            if (blen>=128) break;
+          }
+        }
+        else
+#endif
+        for (unsigned k=0; k<=bk; ++k) {
+          unsigned p=htp[hh1^k];
+          if (p && (p&mask)==cb) {
+            p>>=cbits;
+            if (p<ii && ii+blen<=nn && inp[p+blen-1]==inp[ii+blen-1]) {
               unsigned l;
-              l=matchLength(in+p, in+i, 0, MIN(maxMatch, n-i));
-              int score=l*8-lg(i-p)-2*(lit>0)-11;
+              l=matchLength(inp+p, inp+ii, 0, limit);
+              int score=l*8-lg(ii-p)-2*(lit>0)-11;
               if (score>bscore) blen=l, bp=p, blit=0, bscore=score;
             }
           }
@@ -7148,12 +7259,12 @@ void LZBuffer::fill() {
 
     // If match is long enough, then output any pending literals first,
     // and then the match. blen is the length of the match.
-    assert(i>=bp);
-    const unsigned off=i-bp;  // offset
+    assert(ii>=bp);
+    const unsigned off=ii-bp;  // offset
     if (off>0 && bscore>0
-        && blen-blit>=minMatch+(level==2)*((off>=(1<<16))+(off>=(1<<24)))) {
+        && blen-blit>=mm+(level==2)*((off>=(1<<16))+(off>=(1<<24)))) {
       lit+=blit;
-      write_literal(i+blit, lit);
+      write_literal(ii+blit, lit);
       write_match(blen-blit, off);
     }
 
@@ -7165,44 +7276,46 @@ void LZBuffer::fill() {
 
     // Update index, advance blen bytes
     if (isa)
-      i+=blen;
+      ii+=blen;
     else {
       while (blen--) {
-        if (i+minMatchBoth<n) {
-          unsigned ih=((i*1234547)>>19)&bucket;
-          const unsigned p=(i<<checkbits)|(in[i+3]&mask);
-          assert(ih<=bucket);
-          if (minMatch2) {
-            ht[h2^ih]=p;
-            h2=(((h2*9)<<shift2)
-                +(in[i+minMatch2+lookahead]+1)*23456789u)&(htsize-1);
+        if (ii+mmb<nn) {
+          unsigned ih=((ii*1234547)>>19)&bk;
+          const unsigned p=(ii<<cbits)|(inp[ii+3]&mask);
+          assert(ih<=bk);
+          if (mm2) {
+            htp[hh2^ih]=p;
+            hh2=(((hh2*9)<<sh2)
+                +(inp[ii+mm2+la]+1)*23456789u)&(hts-1);
           }
-          ht[h1^ih]=p;
-          h1=(((h1*5)<<shift1)+(in[i+minMatch]+1)*123456791u)&(htsize-1);
+          htp[hh1^ih]=p;
+          hh1=(((hh1*5)<<sh1)+(inp[ii+mm]+1)*123456791u)&(hts-1);
 
           // Prefetch the hash table rows that will be searched
           // PREFETCH_DIST positions from now. h1p and h2p depend only on
           // the last few input bytes so they need no initialization.
-          if (i+PREFETCH_DIST+minMatchBoth<n) {
-            const unsigned ip=i+PREFETCH_DIST;
-            if (minMatch2) {
-              h2p=(((h2p*9)<<shift2)
-                  +(in[ip+minMatch2+lookahead]+1)*23456789u)&(htsize-1);
-              ZPAQ_PREFETCH(&ht[h2p]);
+          if (ii+PREFETCH_DIST+mmb<nn) {
+            const unsigned ip=ii+PREFETCH_DIST;
+            if (mm2) {
+              hh2p=(((hh2p*9)<<sh2)
+                  +(inp[ip+mm2+la]+1)*23456789u)&(hts-1);
+              ZPAQ_PREFETCH(&htp[hh2p]);
             }
-            h1p=(((h1p*5)<<shift1)+(in[ip+minMatch]+1)*123456791u)
-                &(htsize-1);
-            ZPAQ_PREFETCH(&ht[h1p]);
+            hh1p=(((hh1p*5)<<sh1)+(inp[ip+mm]+1)*123456791u)
+                &(hts-1);
+            hring[(ip+1)&(PREFETCH_DIST-1)]=hh1p;
+            ZPAQ_PREFETCH(&htp[hh1p]);
           }
         }
-        ++i;
+        ++ii;
       }
     }
 
     // Write long literals to keep buf from filling up
-    if (lit>=maxLiteral)
-      write_literal(i, lit);
+    if (lit>=maxl)
+      write_literal(ii, lit);
   }
+  i=ii, h1=hh1, h2=hh2, h1p=hh1p, h2p=hh2p;
 
   // Write pending literals at end of input
   assert(i<=n);
