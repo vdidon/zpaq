@@ -878,6 +878,14 @@ public:
 // Read 16 bit little-endian number
 int toU16(const char* p);
 
+// Allocate nb bytes of zeroed memory backed by large pages (2 MB on x86),
+// which spares the TLB when the memory is accessed at random. Return 0 if
+// the system or the process privileges do not allow it. Freed blocks are
+// kept for reuse because the system is slow to find contiguous memory.
+// Implemented in libzpaq.cpp, Windows only for now.
+void* allocLargePages(size_t nb);
+void freeLargePages(void* p, size_t nb);
+
 // An Array of T is cleared and aligned on a 64 byte address
 //   with no constructors called. No copy or assignment.
 // Array<T> a(n, ex=0);  - creates n<<ex elements of type T
@@ -889,10 +897,11 @@ class Array {
   T *data;     // user location of [0] on a 64 byte boundary
   size_t n;    // user size
   int offset;  // distance back in bytes to start of actual allocation
+  bool large;  // allocated by allocLargePages()?
   void operator=(const Array&);  // no assignment
   Array(const Array&);  // no copy
 public:
-  Array(size_t sz=0, int ex=0): data(0), n(0), offset(0) {
+  Array(size_t sz=0, int ex=0): data(0), n(0), offset(0), large(false) {
     resize(sz, ex);} // [0..sz-1] = 0
   void resize(size_t sz, int ex=0); // change size, erase content to zeros
   ~Array() {resize(0);}  // free memory
@@ -913,15 +922,19 @@ void Array<T>::resize(size_t sz, int ex) {
   if (n>0) {
     assert(offset>0 && offset<=64);
     assert((char*)data-offset);
-    ::free((char*)data-offset);
+    if (large) freeLargePages((char*)data-offset, 128+n*sizeof(T));
+    else ::free((char*)data-offset);
   }
   n=0;
   offset=0;
+  large=false;
   if (sz==0) return;
   n=sz;
   const size_t nb=128+n*sizeof(T);  // test for overflow
   if (nb<=128 || (nb-128)/sizeof(T)!=n) n=0, error("Array too big");
-  data=(T*)::calloc(nb, 1);
+  data=0;
+  if (nb>=(size_t(1)<<22)) data=(T*)allocLargePages(nb), large=data!=0;
+  if (!data) data=(T*)::calloc(nb, 1);
   if (!data) n=0, error("Out of memory");
   offset=64-(((char*)data-(char*)0)&63);
   assert(offset>0 && offset<=64);

@@ -342,6 +342,14 @@ for levels up to 4 and 16 times block size per thread for level 5.
 The default I<Blocksize> is 4 (16 MiB) for types 0 and 1, and 6 (64 MiB)
 otherwise.
 
+On Windows, the tables of 4 MiB or more used by the compression and
+decompression models are allocated in large pages (2 MiB) when the user
+holds the "Lock pages in memory" privilege, which saves about 10% of
+the compression time of C<-m1>. Such memory is never paged out and is not
+counted in the working set of the process. Ordinary pages are used when
+the privilege is missing or when the system is too slow to find the
+contiguous memory.
+
 Types C<x> and C<s> are for experimental use. Normally, zpaq selects
 different methods depending on the compression level
 and an analysis of the data (text, executable, or other binary,

@@ -145,6 +145,101 @@ void allocx(U8* &p, int &n, int newsize) {
 #endif
 }
 
+//////////////////////////// large pages ////////////////////////////
+
+#ifndef unix
+
+// 0 = not tried yet, 1 = large pages available, -1 = not available.
+// Written at most once by each thread with the same value: benign race.
+static int largePagesState=0;
+static size_t largePageSize=0;
+
+// Freed blocks kept for reuse, by size. The system takes tens of ms to
+// find the contiguous memory of a 64 MB block, while a block is used for
+// one compressed block only. The pool never holds more memory than the
+// process had in use at once; it is released at exit.
+enum {LARGE_POOL_SIZE=64};
+static struct {void* p; size_t nb;} largePool[LARGE_POOL_SIZE];
+static int largePoolCount=0;
+static SRWLOCK largePoolLock=SRWLOCK_INIT;
+
+// Enable SeLockMemoryPrivilege, granted by the "Lock pages in memory"
+// policy. Return the large page size, or 0.
+static size_t enableLargePages() {
+  bool ok=false;
+  HANDLE token=0;
+  if (OpenProcessToken(GetCurrentProcess(),
+      TOKEN_ADJUST_PRIVILEGES|TOKEN_QUERY, &token)) {
+    TOKEN_PRIVILEGES tp;
+    tp.PrivilegeCount=1;
+    tp.Privileges[0].Attributes=SE_PRIVILEGE_ENABLED;
+    if (LookupPrivilegeValueA(0, "SeLockMemoryPrivilege",
+        &tp.Privileges[0].Luid)
+        && AdjustTokenPrivileges(token, FALSE, &tp, 0, 0, 0)
+        && GetLastError()==ERROR_SUCCESS)
+      ok=true;
+    CloseHandle(token);
+  }
+  return ok ? GetLargePageMinimum() : 0;
+}
+
+// The system may take a long time to gather the contiguous physical
+// memory of a large page block when memory is fragmented. So only one
+// thread at a time asks the system for a block, the others return 0 and
+// use ordinary pages until a block comes back to the pool, and after a
+// failed or too slow request later calls return 0 at once.
+static SRWLOCK largeAllocLock=SRWLOCK_INIT;
+enum {LARGE_ALLOC_SLOW_MS=200};
+
+void* allocLargePages(size_t nb) {
+  if (largePagesState<0) return 0;
+  if (largePagesState==0) {
+    largePageSize=enableLargePages();
+    largePagesState=largePageSize>0 ? 1 : -1;
+    if (largePagesState<0) return 0;
+  }
+  nb=(nb+largePageSize-1)&~(largePageSize-1);
+  void* p=0;
+  AcquireSRWLockExclusive(&largePoolLock);
+  for (int i=0; i<largePoolCount; ++i) {
+    if (largePool[i].nb==nb) {
+      p=largePool[i].p;
+      largePool[i]=largePool[--largePoolCount];
+      break;
+    }
+  }
+  ReleaseSRWLockExclusive(&largePoolLock);
+  if (p) {
+    memset(p, 0, nb);
+    return p;
+  }
+  if (!TryAcquireSRWLockExclusive(&largeAllocLock)) return 0;
+  const ULONGLONG t0=GetTickCount64();
+  p=VirtualAlloc(0, nb, MEM_COMMIT|MEM_RESERVE|MEM_LARGE_PAGES,
+                 PAGE_READWRITE);
+  if (!p || GetTickCount64()-t0>LARGE_ALLOC_SLOW_MS) largePagesState=-1;
+  ReleaseSRWLockExclusive(&largeAllocLock);
+  return p;
+}
+
+void freeLargePages(void* p, size_t nb) {
+  nb=(nb+largePageSize-1)&~(largePageSize-1);
+  AcquireSRWLockExclusive(&largePoolLock);
+  const bool kept=largePoolCount<LARGE_POOL_SIZE;
+  if (kept) {
+    largePool[largePoolCount].p=p;
+    largePool[largePoolCount].nb=nb;
+    ++largePoolCount;
+  }
+  ReleaseSRWLockExclusive(&largePoolLock);
+  if (!kept) VirtualFree(p, 0, MEM_RELEASE);
+}
+
+#else
+void* allocLargePages(size_t) {return 0;}
+void freeLargePages(void*, size_t) {}
+#endif
+
 //////////////////////////// SHA1 ////////////////////////////
 
 // SHA1 code, see http://en.wikipedia.org/wiki/SHA-1
