@@ -979,6 +979,34 @@ bool ispath(const char* a, const char* b) {
   return *b==0 || *b=='/';
 }
 
+// Return true if any pattern in pats matches filename or any part of it
+// beginning at a path component, so that a pattern without "/" matches
+// a file or directory of that name at any depth. Wildcards and case
+// sensitivity are as in ispath().
+bool isexcluded(const vector<string>& pats, const char* filename) {
+  if (pats.size()==0) return false;
+  for (const char* p=filename;; ++p) {
+    if (p==filename || p[-1]=='/') {  // p begins a path component
+      for (unsigned i=0; i<pats.size(); ++i)
+        if (ispath(pats[i].c_str(), p)) return true;
+    }
+    if (!*p) return false;
+  }
+}
+
+// Append to v the non-empty patterns of a "|" separated list
+void addexcludes(vector<string>& v, const char* s) {
+  string t;
+  for (;; ++s) {
+    if (*s=='|' || *s==0) {
+      if (t.size()>0) v.push_back(t);
+      t="";
+      if (*s==0) return;
+    }
+    else t+=*s;
+  }
+}
+
 // Read 4 byte little-endian int and advance s
 unsigned btoi(const char* &s) {
   s+=4;
@@ -1119,6 +1147,7 @@ private:
   bool noads;               // -noads option (Windows)
   vector<string> notfiles;  // list of prefixes to exclude
   string nottype;           // -not =...
+  vector<string> excludes;  // --exclude: names to skip at any depth
   vector<string> onlyfiles; // list of prefixes to include
   const char* repack;       // -repack output file
   char new_password_string[32]; // -repack hashed password
@@ -1176,6 +1205,7 @@ void Jidac::usage() {
 "   l  list        List or compare external files to archive by dates.\n"
 "Options:\n"
 "  -all [N]        Extract/list versions in N [4] digit directories.\n"
+"  --exclude=P|P   Exclude names matching any P at any depth, e.g. .venv|venv\n"
 "  -f -force       Add: append files if contents have changed.\n"
 "                  Extract: overwrite existing output files.\n"
 "                  List: compare file contents instead of dates.\n"
@@ -1310,6 +1340,15 @@ int Jidac::doCommand(int argc, const char** argv) {
       all=4;
       if (i<argc-1 && isdigit(argv[i+1][0])) all=atoi(argv[++i]);
     }
+    else if (opt=="-exclude" || opt=="--exclude") {  // read excludes
+      while (++i<argc && argv[i][0]!='-')
+        addexcludes(excludes, argv[i]);
+      --i;
+    }
+    else if (opt.size()>9 && opt.compare(0, 9, "-exclude=")==0)
+      addexcludes(excludes, argv[i]+9);
+    else if (opt.size()>10 && opt.compare(0, 10, "--exclude=")==0)
+      addexcludes(excludes, argv[i]+10);
     else if (opt=="-force" || opt=="-f") force=true;
     else if (opt=="-fragment" && i<argc-1) fragment=atoi(argv[++i]);
     else if (opt=="-index" && i<argc-1) index=argv[++i];
@@ -1782,6 +1821,7 @@ bool Jidac::isselected(const char* filename, bool rn) {
     if (ispath(notfiles[i].c_str(), filename))
       return false;
   }
+  if (isexcluded(excludes, filename)) return false;
   return true;
 }
 
@@ -1908,10 +1948,11 @@ void Jidac::scanstreams() {
 // In Windows, filename might have wildcards like "file.*" or "dir/*"
 void Jidac::scandir(string filename) {
 
-  // Don't scan diretories excluded by -not
+  // Don't scan diretories excluded by -not or --exclude
   for (unsigned i=0; i<notfiles.size(); ++i)
     if (ispath(notfiles[i].c_str(), filename.c_str()))
       return;
+  if (isexcluded(excludes, filename.c_str())) return;
 
 #ifdef unix
 
@@ -2013,9 +2054,10 @@ struct DirJob {
   bool done;                // no more work: threads exit
   unsigned nt;              // number of threads
   const vector<string>& notfiles;  // -not: directories to skip
+  const vector<string>& excludes;  // --exclude: directories to skip
   vector<Result> results;
-  DirJob(unsigned nt_, const vector<string>& nf):
-      pending(0), done(false), nt(nt_), notfiles(nf) {
+  DirJob(unsigned nt_, const vector<string>& nf, const vector<string>& ex):
+      pending(0), done(false), nt(nt_), notfiles(nf), excludes(ex) {
     init_mutex(mutex);
     work.init(0);
   }
@@ -2089,6 +2131,7 @@ ThreadReturn dirThread(void* arg) {
         bool skip=false;  // excluded by -not, like scandir(sub+"*")
         for (unsigned j=0; j<job.notfiles.size() && !skip; ++j)
           if (ispath(job.notfiles[j].c_str(), (sub+"*").c_str())) skip=true;
+        if (!skip && isexcluded(job.excludes, sub.c_str())) skip=true;
         if (!skip) {
           job.queue.push_back(sub);
           ++job.pending;
@@ -2130,7 +2173,7 @@ bool Jidac::scandirfast(const string& prefix) {
   // Read all directories
   unsigned nt=threads>0 ? threads : 1;
   if (nt>32) nt=32;
-  DirJob job(nt, notfiles);
+  DirJob job(nt, notfiles, excludes);
   job.queue.push_back(prefix);
   job.pending=1;
   job.work.signal();

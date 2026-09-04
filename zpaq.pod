@@ -223,6 +223,28 @@ More digits will be used when necessary. For example:
 will show the dates when the archive was updated as C<01/>, C<02/>,
 etc. but not their contents.
 
+=item --exclude=I<pattern>[|I<pattern>]...
+
+=item -exclude I<pattern>...
+
+Do not add, extract, or list files whose path matches any I<pattern>
+starting at any C</> separated component, so that a I<pattern> without
+C</> excludes a file or directory of that name at any depth, together
+with its contents. In the first form several patterns are given as one
+argument separated by C<|>; empty patterns are ignored. C<-exclude> and
+C<--exclude> are equivalent. Wildcards C<*> and C<?>, case insensitivity
+in Windows, and the need to quote arguments in Unix/Linux shells are as
+in C<-not>. Excluded directories are not scanned, so excluding a large
+tree also saves the time to read it.
+
+    zpaq add backup.zpaq projects --exclude=".venv|venv|node_modules|*.pyc"
+
+Unlike C<-not>, whose pattern is anchored at the start of the path,
+C<--exclude> matches at any depth. The pattern is compared against the
+whole stored path, including any directory prefix given on the command
+line, so an ancestor directory that matches a pattern excludes
+everything below it.
+
 =item -f
 
 =item -force
