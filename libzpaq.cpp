@@ -6968,6 +6968,41 @@ static inline unsigned rowMatches(const unsigned* row, unsigned mask,
 }
 #endif
 
+// Bit output for level 1 LZ77 codes, LSB first. The state is copied
+// from LZBuffer into this local object while a code is written and copied
+// back afterwards, so that the stores into the output buffer do not force
+// the compiler to reload it. Fewer than 8 bits stay pending between calls.
+struct BitOut {
+  U64 bits;           // pending bits
+  int nbits;          // number of pending bits, 0..7 between calls
+  unsigned char* p;   // next byte to write
+
+  BitOut(U64 b, int nb, unsigned char* wp): bits(b), nbits(nb), p(wp) {}
+
+  // Append the low k bits of x, k<=56. The 8 bytes of bits are stored
+  // at once and p advances past the complete ones. With up to 7 pending
+  // bits, k<=56 keeps nbits below 64: at 64 the shift that drops the
+  // stored bytes would be undefined, and on x86 it shifts by 0, so the
+  // 8 bytes just stored would be or-ed again into the next 8 bytes.
+  void put(U64 x, int k) {
+    assert(k>=0 && k<=56);
+    assert(nbits>=0 && nbits<8);
+    x&=(U64(1)<<k)-1;
+    bits|=x<<nbits;
+    nbits+=k;
+#if (defined(__GNUC__) || defined(__clang__)) && (defined(__x86_64__)     || defined(__i386__) || (defined(__BYTE_ORDER__)     && __BYTE_ORDER__==__ORDER_LITTLE_ENDIAN__))
+    memcpy(p, &bits, 8);
+#elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+    memcpy(p, &bits, 8);
+#else
+    for (int j=0; j<8; ++j) p[j]=bits>>(8*j);
+#endif
+    p+=nbits>>3;
+    bits>>=nbits&~7;
+    nbits&=7;
+  }
+};
+
 // Encode inbuf to buf using LZ77. args are as follows:
 // args[0] is log2 buffer size in MB.
 // args[1] is level (1=var. length, 2=byte aligned lz77, 3=bwt) + 4 if E8E9.
@@ -7003,7 +7038,7 @@ class LZBuffer: public libzpaq::Reader {
   const int minMatchBoth;     // max(minMatch, minMatch2)
   const unsigned rb;          // number of level 1 r bits in match code
   U64 bits;                   // pending output bits (level 1)
-  int nbits;                  // number of bits in bits, 0..31 between calls
+  int nbits;                  // number of bits in bits, 0..7 between calls
   unsigned rpos, wpos;        // read, write pointers
   unsigned idx;               // BWT index
   const unsigned* sa;         // suffix array for BWT or LZ77-SA
@@ -7014,24 +7049,6 @@ class LZBuffer: public libzpaq::Reader {
   void write_literal(unsigned i, unsigned& lit);
   void write_match(unsigned len, unsigned off);
   void fill();  // encode to buf
-
-  // write k bits of x, LSB first. Whole bytes are written 4 at a time.
-  void putb(unsigned x, int k) {
-    assert(k>=0 && k<=24);
-    x&=(1u<<k)-1;
-    bits|=U64(x)<<nbits;
-    nbits+=k;
-    if (nbits>=32) {
-      assert(wpos+4<=BUFSIZE);
-      buf[wpos]=bits;
-      buf[wpos+1]=bits>>8;
-      buf[wpos+2]=bits>>16;
-      buf[wpos+3]=bits>>24;
-      wpos+=4;
-      bits>>=32;
-      nbits-=32;
-    }
-  }
 
   // write pending bytes and the last partial byte
   void flush() {
@@ -7429,14 +7446,25 @@ void LZBuffer::write_literal(unsigned i, unsigned& lit) {
     if (lit<1) return;
     int ll=lg(lit);
     assert(ll>=1 && ll<=24);
-    putb(0, 2);
-    --ll;
-    while (--ll>=0) {
-      putb(1, 1);
-      putb((lit>>ll)&1, 1);
-    }
-    putb(0, 1);
-    while (lit) putb(in[i-lit--], 8);
+
+    BitOut o(bits, nbits, buf+wpos);
+
+    // 00, then the bits of lit below the leading 1 each preceded by a 1,
+    // MSB first, then 0: at most 2+2*23+1 bits, written at once
+    U64 x=0;
+    int k=2;
+    for (--ll; --ll>=0; k+=2) x|=U64(1|((lit>>ll)&1)<<1)<<k;
+    o.put(x, k+1);
+
+    // the literal bytes, 4 per call
+    const unsigned char* p=in+i-lit;
+    const unsigned char* const end=in+i;
+    for (; p+4<=end; p+=4)
+      o.put(p[0]|p[1]<<8|p[2]<<16|unsigned(p[3])<<24, 32);
+    for (; p<end; ++p) o.put(*p, 8);
+    lit=0;
+    assert(o.p+8<=buf+BUFSIZE);
+    bits=o.bits, nbits=o.nbits, wpos=o.p-buf;
   }
   else {
     assert(level==2);
@@ -7464,16 +7492,27 @@ void LZBuffer::write_match(unsigned len, unsigned off) {
     off+=(1<<rb)-1;
     int lo=lg(off)-1-rb;
     assert(lo>=0 && lo<=23);
-    putb((lo+8)>>3, 2);// mm
-    putb(lo&7, 3);     // mmm
-    while (--ll>=2) {  // n
-      putb(1, 1);
-      putb((len>>ll)&1, 1);
+
+    // mm, mmm, n (the bits of len below the leading 1 down to bit 2,
+    // each preceded by a 1, then 0), ll: at most 5+2*13+1+2 bits
+    U64 x=((lo+8)>>3)|(lo&7)<<2;
+    int k=5;
+    for (--ll; ll>=2; --ll, k+=2) x|=U64(1|((len>>ll)&1)<<1)<<k;
+    x|=U64(len&3)<<(k+1);
+    k+=3;
+
+    // r, q: rb+lo bits, at most 31. Both groups fit in one call of at
+    // most 56 bits unless the match is both very long and very far.
+    BitOut o(bits, nbits, buf+wpos);
+    const int ko=rb+lo;
+    if (k+ko<=56)
+      o.put(x|U64(off)<<k, k+ko);
+    else {
+      o.put(x, k);
+      o.put(off, ko);
     }
-    putb(0, 1);
-    putb(len&3, 2);    // ll
-    putb(off, rb);     // r
-    putb(off>>rb, lo); // q
+    assert(o.p+8<=buf+BUFSIZE);
+    bits=o.bits, nbits=o.nbits, wpos=o.p-buf;
   }
 
   // x[2]:len[6] off[x-1] 
