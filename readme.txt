@@ -13,12 +13,12 @@ versions of the program. Contents:
 
 File            Ver.   Description
 -----------     ----   -----------
-zpaq.exe        7.15   Archiver, 32 bit Windows XP or later.
-zpaq64.exe      7.15   Archiver, 64 bit Windows XP or later.
-zpaq.cpp        7.15   zpaq source code.
-zpaq.pod        7.12   zpaq man page in pod2man format.
+zpaq.exe        7.16   Archiver, 32 bit Windows XP or later.
+zpaq64.exe      7.16   Archiver, 64 bit Windows XP or later.
+zpaq.cpp        7.16   zpaq source code.
+zpaq.pod        7.16   zpaq man page in pod2man format.
 libzpaq.h       7.12   libzpaq API documentation and header.
-libzpaq.cpp     7.15   libzpaq API source code.
+libzpaq.cpp     7.16   libzpaq API source code.
 Makefile               To compile with GNU make: make {install|check|clean}
 COPYING                Unlicense.
 

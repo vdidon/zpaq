@@ -1,4 +1,4 @@
-/* libzpaq.cpp - LIBZPAQ Version 7.15 implementation - Aug. 17, 2016.
+/* libzpaq.cpp - LIBZPAQ Version 7.16 implementation - Sep. 4, 2026.
 
   libdivsufsort.c for divsufsort 2.00, included within, is
   (C) 2003-2008 Yuta Mori, all rights reserved.
