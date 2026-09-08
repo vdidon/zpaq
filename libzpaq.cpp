@@ -4397,6 +4397,36 @@ static bool detectSSE41() {
 }
 static const bool haveSSE41=detectSSE41();
 
+// Return true if the CPU and the operating system support AVX2, used to
+// mix and update the MIX weights 8 at a time. The OS must have enabled
+// the upper half of the YMM registers (XCR0 bits 1 and 2), else they are
+// not saved across a context switch.
+static bool detectAVX2() {
+#if defined(ZPAQ_X86INTRIN) && defined(_MSC_VER) && !defined(__clang__)
+  int r[4]={0};
+  __cpuid(r, 0);
+  if (r[0]<7) return false;
+  __cpuid(r, 1);
+  if (!(unsigned(r[2])&(1u<<27))) return false;  // OSXSAVE
+  if ((_xgetbv(0)&6)!=6) return false;           // OS saves YMM
+  __cpuidex(r, 7, 0);
+  return (unsigned(r[1])&(1u<<5))!=0;            // AVX2
+#elif defined(ZPAQ_X86INTRIN)
+  unsigned a=0, b=0, c=0, d=0;
+  if (__get_cpuid_max(0, 0)<7) return false;
+  __cpuid_count(1, 0, a, b, c, d);
+  if (!(c&(1u<<27))) return false;               // OSXSAVE
+  unsigned xa=0, xd=0;
+  __asm__(".byte 0x0f,0x01,0xd0" : "=a"(xa), "=d"(xd) : "c"(0));  // xgetbv
+  if ((xa&6)!=6) return false;                   // OS saves YMM
+  __cpuid_count(7, 0, a, b, c, d);
+  return (b&(1u<<5))!=0;                         // AVX2
+#else
+  return false;
+#endif
+}
+static const bool haveAVX2=detectAVX2();
+
 // Assemble the ZPAQL code in the HCOMP section of z.header to pcomp and
 // return the number of bytes of x86 or x86-64 code written, or that would
 // be written if pcomp were large enough. The code for predict() begins
@@ -4696,7 +4726,37 @@ int Predictor::assemble_p() {
         put3(0x8d3486);                        // lea esi, [esi+eax*4] ; wt
 
         // Unroll summation loop: esi=wt[0..m-1]
-        for (int k=0; k<cp[3]; k+=8) {
+        // With AVX2, sum 16 weights at a time first. vpackssdw interleaves
+        // the two 128 bit lanes, but it does so identically for the weights
+        // and for the predictions, so each weight still meets its own
+        // prediction, and the order of the products does not matter in a
+        // sum. The remaining weights are summed 8 at a time as below.
+        {
+        int k=0;
+        bool acc=false;  // is a partial sum already in xmm0?
+        if (haveAVX2 && cp[3]>=16) {
+          for (; k+16<=cp[3]; k+=16) {
+            put4a(0xc5fe6f8e, k*4);            // vmovdqu ymm1, [esi+k*4]
+            put4a(0xc5fe6f96, k*4+32);         // vmovdqu ymm2, [esi+k*4+32]
+            put4(0xc5f572e1); put1(0x08);      // vpsrad ymm1, ymm1, 8
+            put4(0xc5ed72e2); put1(0x08);      // vpsrad ymm2, ymm2, 8
+            put4(0xc5f56bca);                  // vpackssdw ymm1, ymm1, ymm2
+            put4a(0xc5fe6f9f, off(p[cp[2]+k]));// vmovdqu ymm3, [edi+&p[j+k]]
+            put4a(0xc5fe6fa7, off(p[cp[2]+k+8]));//vmovdqu ymm4,[edi+&p[j+k+8]]
+            put4(0xc5e56bdc);                  // vpackssdw ymm3, ymm3, ymm4
+            if (k==0)
+              put4(0xc5f5f5c3);                // vpmaddwd ymm0, ymm1, ymm3
+            else {
+              put4(0xc5f5f5cb);                // vpmaddwd ymm1, ymm1, ymm3
+              put4(0xc5fdfec1);                // vpaddd ymm0, ymm0, ymm1
+            }
+          }
+          put6(0xc4e37d39, 0xc101);            // vextracti128 xmm1, ymm0, 1
+          put3(0xc5f877);                      // vzeroupper
+          put4(0x660ffec1);                    // paddd xmm0, xmm1
+          acc=true;
+        }
+        for (; k<cp[3]; k+=8) {
           const int tail=cp[3]-k;  // number of elements remaining
 
           // pack 8 elements of wt in xmm1, 8 elements of p in xmm3
@@ -4714,7 +4774,7 @@ int Predictor::assemble_p() {
             put5(0x660f73dd, 16-tail*2);       // psrldq xmm5, 16-tail*2
             put4(0x660fdbcd);                  // pand xmm1, xmm5
           }
-          if (k==0) {  // first loop, initialize sum in xmm0
+          if (k==0 && !acc) {  // first loop, initialize sum in xmm0
             put4(0xf30f6fc1);                  // movdqu xmm0, xmm1
             put4(0x660ff5c3);                  // pmaddwd xmm0, xmm3
           }
@@ -4722,6 +4782,7 @@ int Predictor::assemble_p() {
             put4(0x660ff5cb);                  // pmaddwd xmm1, xmm3
             put4(0x660ffec1);                  // paddd xmm0, xmm1
           }
+        }
         }
 
         // Add up the 4 elements of xmm0 = p[i] in the first element
@@ -5132,22 +5193,47 @@ int Predictor::assemble_p() {
         if (S==8) put1(0x48);          // rex.w
         put3(0x8d3486);                // lea esi, [esi+eax*4] ; wt
 
-        // Update 4 weights at a time with SSE4.1 (pmulld, pminsd, pmaxsd)
-        // when the CPU has it, then the remaining 0..3 weights in scalar
-        // code. The vector code gives the same 32 bit results as the
-        // scalar code: the product wraps the same way and the shifts are
-        // arithmetic.
+        // Update 8 weights at a time with AVX2, then 4 at a time with
+        // SSE4.1 (pmulld, pminsd, pmaxsd), then the remaining weights in
+        // scalar code. The vector code gives the same 32 bit results as
+        // the scalar code: the product wraps the same way and the shifts
+        // are arithmetic. The AVX2 constants leave the SSE4.1 ones in the
+        // low half of the same registers, so they are built only once.
         {
         int k=0;
-        if (haveSSE41 && cp[3]>=4) {
-          put4(0x660f6ec1);            // movd xmm0, ecx ; err
-          put5(0x660f70c0,0x00);       // pshufd xmm0, xmm0, 0 ; err x4
-          put4(0x660f76ed);            // pcmpeqd xmm5, xmm5 ; -1
-          put5(0x660f72f5,0x0c);       // pslld xmm5, 12 ; -4096
-          put4(0x660f76e4);            // pcmpeqd xmm4, xmm4
-          put5(0x660f72d4,0x0d);       // psrld xmm4, 13 ; (1<<19)-1
-          put4(0x660f76db);            // pcmpeqd xmm3, xmm3
-          put5(0x660f72f3,0x13);       // pslld xmm3, 19 ; -1<<19
+        if (haveAVX2 && cp[3]>=8) {
+          put4(0xc5f96ec1);            // vmovd xmm0, ecx ; err
+          put5(0xc4e27d58,0xc0);       // vpbroadcastd ymm0, xmm0 ; err x8
+          put3(0xc5d576); put1(0xed);  // vpcmpeqd ymm5, ymm5, ymm5 ; -1
+          put4(0xc5d572f5); put1(0x0c);// vpslld ymm5, ymm5, 12 ; -4096
+          put3(0xc5dd76); put1(0xe4);  // vpcmpeqd ymm4, ymm4, ymm4
+          put4(0xc5dd72d4); put1(0x0d);// vpsrld ymm4, ymm4, 13 ; (1<<19)-1
+          put3(0xc5e576); put1(0xdb);  // vpcmpeqd ymm3, ymm3, ymm3
+          put4(0xc5e572f3); put1(0x13);// vpslld ymm3, ymm3, 19 ; -1<<19
+          for (; k+8<=cp[3]; k+=8) {
+            put4a(0xc5fe6f8f, off(p[cp[2]+k])); // vmovdqu ymm1,[edi+&p[j+k]]
+            put5(0xc4e27540,0xc8);     // vpmulld ymm1, ymm1, ymm0 ; err*p
+            put4(0xc5f5facd);          // vpsubd ymm1, ymm1, ymm5 ; +4096
+            put4(0xc5f572e1); put1(0x0d);// vpsrad ymm1, ymm1, 13
+            put4a(0xc5fe6f96, k*4);    // vmovdqu ymm2, [esi+k*4] ; wt
+            put4(0xc5f5feca);          // vpaddd ymm1, ymm1, ymm2
+            put5(0xc4e27539,0xcc);     // vpminsd ymm1, ymm1, ymm4
+            put5(0xc4e2753d,0xcb);     // vpmaxsd ymm1, ymm1, ymm3
+            put4a(0xc5fe7f8e, k*4);    // vmovdqu [esi+k*4], ymm1
+          }
+          put3(0xc5f877);              // vzeroupper
+        }
+        if (haveSSE41 && k+4<=cp[3]) {
+          if (k==0) {                  // else the AVX2 code built them
+            put4(0x660f6ec1);          // movd xmm0, ecx ; err
+            put5(0x660f70c0,0x00);     // pshufd xmm0, xmm0, 0 ; err x4
+            put4(0x660f76ed);          // pcmpeqd xmm5, xmm5 ; -1
+            put5(0x660f72f5,0x0c);     // pslld xmm5, 12 ; -4096
+            put4(0x660f76e4);          // pcmpeqd xmm4, xmm4
+            put5(0x660f72d4,0x0d);     // psrld xmm4, 13 ; (1<<19)-1
+            put4(0x660f76db);          // pcmpeqd xmm3, xmm3
+            put5(0x660f72f3,0x13);     // pslld xmm3, 19 ; -1<<19
+          }
           for (; k+4<=cp[3]; k+=4) {
             put4a(0xf30f6f8f, off(p[cp[2]+k])); // movdqu xmm1, [edi+&p[j+k]]
             put5(0x660f3840,0xc8);     // pmulld xmm1, xmm0 ; err*p
@@ -5159,10 +5245,10 @@ int Predictor::assemble_p() {
             put5(0x660f383d,0xcb);     // pmaxsd xmm1, xmm3
             put4a(0xf30f7f8e, k*4);    // movdqu [esi+k*4], xmm1
           }
-          if (k<cp[3]) {
-            if (S==8) put1(0x48);      // rex.w
-            put2a(0x81c6, k*4);        // add esi, k*4
-          }
+        }
+        if (k>0 && k<cp[3]) {          // point esi at the first scalar weight
+          if (S==8) put1(0x48);        // rex.w
+          put2a(0x81c6, k*4);          // add esi, k*4
         }
         for (; k<cp[3]; ++k) {
           put2a(0x8b87,off(p[cp[2]+k]));//mov eax, [edi+&p[cp[2]+k]
