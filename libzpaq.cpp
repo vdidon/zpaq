@@ -2190,6 +2190,7 @@ Predictor::Predictor(ZPAQL& zr):
   assert(sizeof(int)==4);
   pcode=0;
   pcode_size=0;
+  upofs=0;
   initTables=false;
 }
 
@@ -2701,10 +2702,11 @@ int Decoder::decompress() {
     }
     else {
       int c=1;
+      int p=pr.predict()*2+1;
       while (c<256) {  // get 8 bits
-        int p=pr.predict()*2+1;
         c+=c+decode(p);
-        pr.update(c&1);
+        if (c<256) p=pr.updatePredict(c&1)*2+1;
+        else pr.update(c&1);
       }
       return c-256;
     }
@@ -2989,12 +2991,13 @@ void Encoder::compress(int c) {
     else {
       assert(c>=0 && c<=255);
       encode(0, 0);
+      int p=pr.predict()*2+1;
       for (int i=7; i>=0; --i) {
-        int p=pr.predict()*2+1;
         assert(p>0 && p<65536);
         int y=c>>i&1;
         encode(y, p);
-        pr.update(y);
+        if (i>0) p=pr.updatePredict(y)*2+1;
+        else pr.update(y);
       }
     }
   }
@@ -4466,6 +4469,10 @@ int Predictor::assemble_p() {
 #endif
   }
 
+  // Start of the body of predict(), which update()+predict() jumps to
+  // once it has updated the model and the bit context.
+  const int predict_body=o;
+
   // Code predict() for each component
   const int n=hcomp[6];  // number of components
   U8* cp=hcomp+7;
@@ -4889,6 +4896,12 @@ int Predictor::assemble_p() {
 #endif
   }
 
+  // r8 tells the end of update() whether it was entered by update() or by
+  // update()+predict(). Only x86-64 has the spare register, so the fused
+  // entry point exists there only.
+  if (S==8) put3(0x4531c0);    // xor r8d, r8d ; not fused
+  const int update_body=o;
+
   // Code update() for each component
   cp=hcomp+7;
   for (int i=0; i<n; ++i, cp+=compsize[cp[0]]) {
@@ -5276,12 +5289,74 @@ int Predictor::assemble_p() {
     }
   }
 
+  // If entered through updatePredict(), save the bit in c8 and hmap4 as
+  // Predictor::update() does, then fall into predict() without returning.
+  // A byte boundary needs z.run() and the context hashes, which stay in
+  // C++: return -1 and let the caller finish and call predict() itself.
+  if (S==8) {
+    put3(0x4585c0);           // test r8d, r8d
+    put2(0x7461);             // jz L_ret ; plain update()
+    put2(0x8b07);             // mov eax, [edi] ; c8
+    put2(0x01c0);             // add eax, eax
+    put2(0x01e8);             // add eax, ebp ; c8=c8*2+y
+    put2(0x8907);             // mov [edi], eax
+    put1a(0x3d, 256);         // cmp eax, 256
+    put2(0x734d);             // jae L_boundary
+    put3(0x83f820);           // cmp eax, 32
+    put2(0x7323);             // jae L_else
+    put3(0x83f810);           // cmp eax, 16
+    put2(0x721e);             // jb L_else
+                              // hmap4=(hmap4&0xf)<<5|y<<4|1
+    put2a(0x8b8f, off(hmap4));// mov ecx, [edi+&hmap4]
+    put3(0x83e10f);           // and ecx, 15
+    put3(0xc1e105);           // shl ecx, 5
+    put2(0x89ea);             // mov edx, ebp ; y
+    put3(0xc1e204);           // shl edx, 4
+    put2(0x09d1);             // or ecx, edx
+    put3(0x83c901);           // or ecx, 1
+    put2a(0x898f, off(hmap4));// mov [edi+&hmap4], ecx
+    put2(0xeb20);             // jmp L_predict
+                              // L_else: hmap4=(hmap4&0x1f0)
+    put2a(0x8b8f, off(hmap4));//   |(((hmap4&0xf)*2+y)&0xf)
+    put2(0x89ca);             // mov edx, ecx
+    put3(0x83e20f);           // and edx, 15
+    put2(0x01d2);             // add edx, edx
+    put2(0x01ea);             // add edx, ebp
+    put3(0x83e20f);           // and edx, 15
+    put2a(0x81e1, 0x1f0);     // and ecx, 0x1f0
+    put2(0x09d1);             // or ecx, edx
+    put2a(0x898f, off(hmap4));// mov [edi+&hmap4], ecx
+                              // L_predict:
+    const int dp=predict_body-o-5;  // put1a() bumps o before puta()
+    put1a(0xe9, dp);          // jmp predict_body
+    put1a(0xb8, 0xffffffff);  // L_boundary: mov eax, -1
+  }
+
   // return from update()
-  put1(0x5f);                 // pop edi
+  put1(0x5f);                 // L_ret: pop edi
   put1(0x5e);                 // pop esi
   put1(0x5d);                 // pop ebp
   put1(0x5b);                 // pop ebx
   put1(0xc3);                 // ret
+
+  // Entry point of updatePredict(): same arguments as update(), but it
+  // returns the prediction, or -1 at a byte boundary.
+  if (S==8) {
+    pr.upofs=o;
+    put1(0x53);               // push ebx/rbx
+    put1(0x55);               // push ebp/rbp
+    put1(0x56);               // push esi/rsi
+    put1(0x57);               // push edi/rdi
+#if defined(unix) && !defined(__CYGWIN__)
+    put3(0x4889f5);           // mov rbp, rsi (2nd arg in Linux-64)
+#else
+    put3(0x4889cf);           // mov rdi, rcx (1st arg in Win64)
+    put3(0x4889d5);           // mov rbp, rdx (2nd arg)
+#endif
+    put2a(0x41b8, 1);         // mov r8d, 1 ; fused
+    const int du=update_body-o-5;
+    put1a(0xe9, du);          // jmp update_body
+  }
 
   return o;
 }
@@ -5339,6 +5414,41 @@ void Predictor::update(int y) {
     hmap4=(hmap4&0xf)<<5|y<<4|1;
   else
     hmap4=(hmap4&0x1f0)|(((hmap4&0xf)*2+y)&0xf);
+#endif
+}
+
+// Update the model with bit y and return the prediction of the next bit,
+// in one call to the JIT code, which saves a call, a prologue and an
+// epilogue per bit. At a byte boundary the JIT code returns -1, because
+// the new context hashes need z.run(), which stays in C++.
+int Predictor::updatePredict(int y) {
+#ifdef NOJIT
+  update0(y);
+  return predict0();
+#else
+  if (!pcode || !upofs) {  // no JIT yet, or no fused entry point
+    update(y);
+    return predict();
+  }
+
+  // Prefetch the rows of the next bit before the model is updated, so
+  // that the memory latency overlaps the update and the next predict.
+  if (c8<128) {
+    const int c8n=c8*2+y;
+    prefetchNext(c8n, c8n>=16 && c8n<32 ? (hmap4&0xf)<<5|y<<4|1
+                 : (hmap4&0x1f0)|(((hmap4&0xf)*2+y)&0xf));
+  }
+  const int p=((int(*)(Predictor*, int))&pcode[upofs])(this, y);
+  if (p>=0) return p;
+
+  // Byte boundary: the JIT code saved c8 and returned -1
+  assert(c8>=256);
+  z.run(c8-256);
+  hmap4=1;
+  c8=1;
+  for (int i=0; i<z.header[6]; ++i) h[i]=z.H(i);
+  prefetchByte();
+  return predict();
 #endif
 }
 

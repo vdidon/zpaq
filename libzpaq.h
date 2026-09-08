@@ -1133,6 +1133,7 @@ public:
   void init();          // build model
   int predict();        // probability that next bit is a 1 (0..4095)
   void update(int y);   // train on bit y (0..1)
+  int updatePredict(int y);  // update(y) then predict() in one JIT call
   int stat(int);        // Defined externally
   bool isModeled() {    // n>0 components?
     assert(z.header.isize()>6);
@@ -1159,6 +1160,7 @@ private:
   StateTable st;        // next, cminit functions
   U8* pcode;            // JIT code for predict() and update()
   int pcode_size;       // length of pcode
+  int upofs;            // entry point in pcode of update()+predict(), or 0
 
   // reduce prediction error in cr.cm
   void train(Component& cr, int y) {
