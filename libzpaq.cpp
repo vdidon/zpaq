@@ -44,10 +44,13 @@ See libzpaq.h for additional documentation.
 // Memory prefetch hint (no-op if the compiler does not support it)
 #if defined(__GNUC__) || defined(__clang__)
 #define ZPAQ_PREFETCH(p) __builtin_prefetch(p)
+#define ZPAQ_PREFETCH_BARRIER() __asm__ __volatile__("" ::: "memory")
 #elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
 #define ZPAQ_PREFETCH(p) _mm_prefetch((const char*)(p), _MM_HINT_T0)
+#define ZPAQ_PREFETCH_BARRIER() ((void)0)
 #else
 #define ZPAQ_PREFETCH(p) ((void)0)
+#define ZPAQ_PREFETCH_BARRIER() ((void)0)
 #endif
 
 // SSE2 is used to test a row of the LZ77 hash table at once
@@ -2323,6 +2326,85 @@ void Predictor::init() {
     cp+=compsize[*cp];
     assert(cp>=&z.header[7] && cp<&z.header[z.cend]);
   }
+  initPrefetch();
+}
+
+// List the tables too large to stay in the cache
+void Predictor::initPrefetch() {
+  nsse=nmix=ncm=nmatch=nht=0;
+  const size_t PFMIN=1<<18;
+  const int n=z.header[6];
+  const U8* cp=&z.header[7];
+  for (int i=0; i<n; ++i, cp+=compsize[cp[0]]) {
+    Component& cr=comp[i];
+    switch (cp[0]) {
+      case CM:
+        if (cr.cm.size()*4>=PFMIN && ncm<16) {
+          pfcm[ncm].p=(char*)&cr.cm[0]; pfcm[ncm].mask=cr.cm.size()-1;
+          pfcm[ncm].i=i; ++ncm;
+        }
+        break;
+      case ICM: case ISSE:
+        if (cr.ht.size()>=PFMIN && nht<64) {
+          pfht[nht].p=(char*)&cr.ht[0]; pfht[nht].mask=cr.ht.size()-16;
+          pfht[nht].i=i; ++nht;
+        }
+        break;
+      case MATCH:
+        if (cr.cm.size()*4>=PFMIN && nmatch<8) {
+          pfmatch[nmatch].p=(char*)&cr.cm[0];
+          pfmatch[nmatch].mask=cr.cm.size()-1;
+          pfmatch[nmatch].i=i; ++nmatch;
+        }
+        break;
+      case MIX:
+        if (cr.cm.size()*4>=PFMIN && nmix<8) {
+          pfmix[nmix].p=(char*)&cr.cm[0]; pfmix[nmix].mask=cr.c-1;
+          pfmix[nmix].m=cp[3]; pfmix[nmix].cmask=cp[5];
+          pfmix[nmix].i=i; ++nmix;
+        }
+        break;
+      case SSE:
+        if (cr.cm.size()*4>=PFMIN && nsse<8) {
+          pfsse[nsse].p=(char*)&cr.cm[0]; pfsse[nsse].mask=(cr.cm.size()>>5)-1;
+          pfsse[nsse].i=i; ++nsse;
+        }
+        break;
+      default: break;
+    }
+  }
+}
+
+// Prefetch the rows that predict() will read for bit c8n (1..255)
+// with nibble state hmap4n.
+void Predictor::prefetchNext(int c8n, int hmap4n) {
+  // A function made only of prefetches has no visible effect for g++,
+  // which then infers it is const and deletes the calls to it (seen with
+  // g++ 14 -O3). The barrier gives it a side effect.
+  ZPAQ_PREFETCH_BARRIER();
+  for (int k=0; k<nsse; ++k) {
+    const char* q=pfsse[k].p+((h[pfsse[k].i]+c8n)&pfsse[k].mask)*128;
+    ZPAQ_PREFETCH(q); ZPAQ_PREFETCH(q+64);
+  }
+  for (int k=0; k<nmix; ++k) {
+    const PfRow& f=pfmix[k];
+    const char* q=f.p+((h[f.i]+(c8n&f.cmask))&f.mask)*f.m*4;
+    ZPAQ_PREFETCH(q); if (f.m*4>64) ZPAQ_PREFETCH(q+64);
+  }
+  if (c8n==1 || (c8n&0xf0)==16) {  // new nibble: hash table rows
+    for (int k=0; k<nht; ++k)
+      ZPAQ_PREFETCH(pfht[k].p+(((h[pfht[k].i]+16*c8n)*16)&pfht[k].mask));
+    for (int k=0; k<ncm; ++k)
+      ZPAQ_PREFETCH(pfcm[k].p+((h[pfcm[k].i]^hmap4n)&pfcm[k].mask)*4);
+  }
+}
+
+// After h[] changed: rows of the first bit and the MATCH index
+void Predictor::prefetchByte() {
+  ZPAQ_PREFETCH_BARRIER();
+  for (int k=0; k<nmatch; ++k)
+    ZPAQ_PREFETCH(pfmatch[k].p+(h[pfmatch[k].i]&pfmatch[k].mask)*4);
+  prefetchNext(1, 1);
 }
 
 // Return next bit prediction using interpreted COMP code
@@ -2432,6 +2514,13 @@ void Predictor::update0(int y) {
   assert(c8>=1 && c8<=255);
   assert(hmap4>=1 && hmap4<=511);
 
+  // Prefetch the rows of the next bit, see update()
+  if (c8<128) {
+    const int c8n=c8*2+y;
+    prefetchNext(c8n, c8n>=16 && c8n<32 ? (hmap4&0xf)<<5|y<<4|1
+                 : (hmap4&0x1f0)|(((hmap4&0xf)*2+y)&0xf));
+  }
+
   // Update components
   const U8* cp=&z.header[7];
   int n=z.header[6];
@@ -2533,6 +2622,7 @@ void Predictor::update0(int y) {
     hmap4=1;
     c8=1;
     for (int i=0; i<n; ++i) h[i]=z.H(i);
+    prefetchByte();
   }
   else if (c8>=16 && c8<32)
     hmap4=(hmap4&0xf)<<5|y<<4|1;
@@ -5140,6 +5230,14 @@ void Predictor::update(int y) {
   update0(y);
 #else
   assert(pcode && pcode[5]);
+
+  // Prefetch the rows of the next bit before the model is updated, so
+  // that the memory latency overlaps the update and the next predict.
+  if (c8<128) {
+    const int c8n=c8*2+y;
+    prefetchNext(c8n, c8n>=16 && c8n<32 ? (hmap4&0xf)<<5|y<<4|1
+                 : (hmap4&0x1f0)|(((hmap4&0xf)*2+y)&0xf));
+  }
   ((void(*)(Predictor*, int))&pcode[5])(this, y);
 
   // Save bit y in c8, hmap4 (not implemented in JIT)
@@ -5149,6 +5247,7 @@ void Predictor::update(int y) {
     hmap4=1;
     c8=1;
     for (int i=0; i<z.header[6]; ++i) h[i]=z.H(i);
+    prefetchByte();
   }
   else if (c8>=16 && c8<32)
     hmap4=(hmap4&0xf)<<5|y<<4|1;

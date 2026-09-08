@@ -1202,6 +1202,16 @@ private:
 
   // Put JIT code in pcode
   int assemble_p();
+
+  // Tables too large for the cache: their rows are prefetched as soon as
+  // the context of the next bit is known, at the start of update().
+  struct PfRow {char* p; U32 mask; U32 m; U32 cmask; int i;};
+  PfRow pfsse[8], pfmix[8], pfcm[16], pfmatch[8];
+  struct PfHt {char* p; U32 mask; int i;} pfht[64];
+  int nsse, nmix, ncm, nmatch, nht;
+  void initPrefetch();
+  void prefetchNext(int c8n, int hmap4n);  // rows read for bit c8n
+  void prefetchByte();                     // after h[] changed
 };
 
 //////////////////////////// Decoder /////////////////////////
