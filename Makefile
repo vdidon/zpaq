@@ -51,13 +51,30 @@ install: zpaq zpaq.1
 	install -m 0755 -d $(DESTDIR)$(MANDIR)/man1
 	install -m 0644 zpaq.1 $(DESTDIR)$(MANDIR)/man1
 
-clean:
-	-$(RM) zpaq.o libzpaq.o zpaq zpaq.exe zpaq.1 archive.zpaq zpaq.new zpaq.new.exe
+lztest$(EXE): lztest.cpp
+	$(CXX) $(CXXFLAGS) -o $@ lztest.cpp
 
-check: zpaq$(EXE)
+clean:
+	-$(RM) zpaq.o libzpaq.o zpaq zpaq.exe zpaq.1 archive.zpaq zpaq.new zpaq.new.exe lztest lztest.exe lztest.bin lztest.zpaq lztest.new
+
+# Round trip of the program itself, then of data with long and far
+# matches through two configurations of the level 1 LZ77 encoder: the
+# one of -m4 on barely compressible data (64 MB blocks) and the one of
+# -m1 on redundant data (16 MB blocks). Its bit packing once broke only
+# on such matches, once in eight, and only a few blocks of an archive.
+check: zpaq$(EXE) lztest$(EXE)
 	$(RUN)zpaq$(EXE) add archive.zpaq zpaq$(EXE)
 	$(RUN)zpaq$(EXE) extract archive.zpaq zpaq$(EXE) -to zpaq.new$(EXE)
 	$(CMP) zpaq$(EXE) zpaq.new$(EXE)
 	$(RM) archive.zpaq zpaq.new$(EXE)
+	$(RUN)lztest$(EXE) lztest.bin
+	$(RUN)zpaq$(EXE) add lztest.zpaq lztest.bin -method x6,1,4,0,3,25 -threads 1
+	$(RUN)zpaq$(EXE) extract lztest.zpaq lztest.bin -to lztest.new
+	$(CMP) lztest.bin lztest.new
+	$(RM) lztest.zpaq lztest.new
+	$(RUN)zpaq$(EXE) add lztest.zpaq lztest.bin -method x4,1,5,0,3,24 -threads 1
+	$(RUN)zpaq$(EXE) extract lztest.zpaq lztest.bin -to lztest.new
+	$(CMP) lztest.bin lztest.new
+	$(RM) lztest.zpaq lztest.new lztest.bin
 
 .PHONY: all install clean check
