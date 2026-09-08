@@ -4287,6 +4287,26 @@ int ZPAQL::assemble() {
 
 //////////////////////// Predictor::assemble_p() /////////////////////
 
+// Return true if the CPU supports SSE4.1, used to update the MIX
+// weights 4 at a time. Without cpuid support the scalar code is used.
+static bool detectSSE41() {
+#if defined(ZPAQ_X86INTRIN) && defined(_MSC_VER) && !defined(__clang__)
+  int r[4]={0};
+  __cpuid(r, 0);
+  if (r[0]<1) return false;
+  __cpuid(r, 1);
+  return (unsigned(r[2])&(1u<<19))!=0;
+#elif defined(ZPAQ_X86INTRIN)
+  unsigned a=0, b=0, c=0, d=0;
+  if (__get_cpuid_max(0, 0)<1) return false;
+  __cpuid_count(1, 0, a, b, c, d);
+  return (c&(1u<<19))!=0;
+#else
+  return false;
+#endif
+}
+static const bool haveSSE41=detectSSE41();
+
 // Assemble the ZPAQL code in the HCOMP section of z.header to pcomp and
 // return the number of bytes of x86 or x86-64 code written, or that would
 // be written if pcomp were large enough. The code for predict() begins
@@ -5022,7 +5042,39 @@ int Predictor::assemble_p() {
         if (S==8) put1(0x48);          // rex.w
         put3(0x8d3486);                // lea esi, [esi+eax*4] ; wt
 
-        for (int k=0; k<cp[3]; ++k) {
+        // Update 4 weights at a time with SSE4.1 (pmulld, pminsd, pmaxsd)
+        // when the CPU has it, then the remaining 0..3 weights in scalar
+        // code. The vector code gives the same 32 bit results as the
+        // scalar code: the product wraps the same way and the shifts are
+        // arithmetic.
+        {
+        int k=0;
+        if (haveSSE41 && cp[3]>=4) {
+          put4(0x660f6ec1);            // movd xmm0, ecx ; err
+          put5(0x660f70c0,0x00);       // pshufd xmm0, xmm0, 0 ; err x4
+          put4(0x660f76ed);            // pcmpeqd xmm5, xmm5 ; -1
+          put5(0x660f72f5,0x0c);       // pslld xmm5, 12 ; -4096
+          put4(0x660f76e4);            // pcmpeqd xmm4, xmm4
+          put5(0x660f72d4,0x0d);       // psrld xmm4, 13 ; (1<<19)-1
+          put4(0x660f76db);            // pcmpeqd xmm3, xmm3
+          put5(0x660f72f3,0x13);       // pslld xmm3, 19 ; -1<<19
+          for (; k+4<=cp[3]; k+=4) {
+            put4a(0xf30f6f8f, off(p[cp[2]+k])); // movdqu xmm1, [edi+&p[j+k]]
+            put5(0x660f3840,0xc8);     // pmulld xmm1, xmm0 ; err*p
+            put4(0x660ffacd);          // psubd xmm1, xmm5 ; +4096
+            put5(0x660f72e1,0x0d);     // psrad xmm1, 13
+            put4a(0xf30f6f96, k*4);    // movdqu xmm2, [esi+k*4] ; wt
+            put4(0x660ffeca);          // paddd xmm1, xmm2
+            put5(0x660f3839,0xcc);     // pminsd xmm1, xmm4
+            put5(0x660f383d,0xcb);     // pmaxsd xmm1, xmm3
+            put4a(0xf30f7f8e, k*4);    // movdqu [esi+k*4], xmm1
+          }
+          if (k<cp[3]) {
+            if (S==8) put1(0x48);      // rex.w
+            put2a(0x81c6, k*4);        // add esi, k*4
+          }
+        }
+        for (; k<cp[3]; ++k) {
           put2a(0x8b87,off(p[cp[2]+k]));//mov eax, [edi+&p[cp[2]+k]
           put3(0x0fafc1);              // imul eax, ecx
           put1a(0x05, 1<<12);          // add eax, 1<<12
@@ -5039,6 +5091,7 @@ int Predictor::assemble_p() {
             if (S==8) put1(0x48);      // rex.w
             put3(0x83c604);            // add esi, 4
           }
+        }
         }
         break;
 
