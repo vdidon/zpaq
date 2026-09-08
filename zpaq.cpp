@@ -395,6 +395,15 @@ const char* const WB="wb";
 const char* const RBPLUS="rb+";
 const char* const WBPLUS="wb+";
 
+// If the last read of fp failed, put the reason in msg, clear the
+// error and return true.
+bool readError(FP fp, std::string& msg) {
+  if (!ferror(fp)) return false;
+  msg=strerror(errno);
+  clearerr(fp);
+  return true;
+}
+
 #else // Windows
 typedef HANDLE FP;
 const FP FPNULL=INVALID_HANDLE_VALUE;
@@ -421,12 +430,30 @@ int fclose(FP fp) {
   return CloseHandle(fp) ? 0 : EOF;
 }
 
+// Error code of the last failed ReadFile() in this thread, or 0.
+// End of file is not a failure: ReadFile() then reads 0 bytes.
+static thread_local DWORD lastReadError=0;
+
 // Read nobj objects of size size into ptr. Return number of objects read.
 size_t fread(void* ptr, size_t size, size_t nobj, FP fp) {
   DWORD r=0;
-  ReadFile(fp, ptr, size*nobj, &r, NULL);
+  if (!ReadFile(fp, ptr, size*nobj, &r, NULL)) {
+    const DWORD e=GetLastError();
+    if (e!=ERROR_HANDLE_EOF && e!=ERROR_BROKEN_PIPE) lastReadError=e;
+  }
   if (size>1) r/=size;
   return r;
+}
+
+// If the last read in this thread failed, put the reason in msg, clear
+// the error and return true.
+bool readError(FP, std::string& msg) {
+  if (!lastReadError) return false;
+  char buf[64];
+  sprintf(buf, "Windows error %lu", (unsigned long)lastReadError);
+  msg=buf;
+  lastReadError=0;
+  return true;
 }
 
 // Write nobj objects of size size from ptr to fp. Return number written.
@@ -695,14 +722,19 @@ public:
   }
 
   // Read up to len bytes into obuf at current offset. Return 0..len bytes
-  // actually read. 0 indicates EOF.
+  // actually read. 0 indicates EOF. A read error is reported as such,
+  // else it would look like a truncated or corrupted archive.
   int read(char* obuf, int len) {
     int nr=fread(obuf, 1, len, fp);
     if (nr==0) {
       seek(0, SEEK_CUR);
       nr=fread(obuf, 1, len, fp);
     }
-    if (nr==0) return 0;
+    if (nr==0) {
+      std::string msg;
+      if (readError(fp, msg)) error(("archive read error: "+msg).c_str());
+      return 0;
+    }
     if (aes) aes->encrypt(obuf, nr, off);
     off+=nr;
     return nr;
