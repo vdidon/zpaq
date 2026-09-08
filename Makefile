@@ -16,9 +16,11 @@ EXE=.exe
 LDLIBS=
 LDFLAGS+=-static
 ALL=zpaq$(EXE)
-RUN=
 RM=del /q /f
 CMP=fc /b >nul
+# ./ so that check runs the binary just built, not one in PATH: with an
+# empty prefix, make launches the program found in PATH first.
+RUN=./
 else
 CPPFLAGS+=-Dunix
 EXE=
