@@ -93,6 +93,33 @@ See libzpaq.h for additional documentation.
 #define ZPAQ_AESNI_TARGET ZPAQ_TARGET("aes,sse2")
 #endif
 
+// SHA-1 and AES hardware acceleration using the ARMv8 Crypto Extension on
+// 64-bit ARM (Raspberry Pi 4/5, Apple silicon...) with g++ or clang,
+// selected at run time. Compile with -DNOSHANI or -DNOAESNI to disable.
+#if defined(__aarch64__) \
+    && (defined(__clang__) || (defined(__GNUC__) && __GNUC__>=10))
+#include <arm_neon.h>
+#if defined(__linux__)
+#include <sys/auxv.h>
+#endif
+#if defined(__clang__)
+#define ZPAQ_ARMSHA_TARGET __attribute__((target("sha2")))
+#define ZPAQ_ARMAES_TARGET __attribute__((target("aes")))
+#else
+#define ZPAQ_ARMSHA_TARGET __attribute__((target("+sha2")))
+#define ZPAQ_ARMAES_TARGET __attribute__((target("+aes")))
+#endif
+#ifndef NOSHANI
+#define ZPAQ_ARMSHA 1
+#endif
+#ifndef NOAESNI
+#define ZPAQ_ARMAES 1
+#endif
+#endif
+#if defined(ZPAQ_SHANI) || defined(ZPAQ_ARMSHA)
+#define ZPAQ_SHA1HW 1
+#endif
+
 namespace libzpaq {
 
 // Read 16 bit little-endian number
@@ -317,7 +344,7 @@ static bool detectSHANI() {
 #endif
   return (b&(1u<<29))!=0;  // SHA
 }
-static const bool haveSHANI=detectSHANI();
+static const bool haveSHA1HW=detectSHANI();
 
 // 80 rounds of SHA-1 on state (ABCD, E0) with a 64 byte message in
 // MSG0..MSG3, each holding 4 big-endian words, first word in the high lane.
@@ -512,12 +539,82 @@ ZPAQ_SHANI_TARGET static void sha1ProcessBytes(U32* h, const unsigned char* p,
 
 #endif  // ZPAQ_SHANI
 
+#ifdef ZPAQ_ARMSHA
+
+// Return true if the CPU supports the SHA-1 instructions
+static bool detectARMSHA() {
+#if defined(__APPLE__)
+  return true;  // every 64-bit ARM Mac has them
+#elif defined(__linux__)
+#ifndef HWCAP_SHA1
+#define HWCAP_SHA1 (1<<5)
+#endif
+  return (getauxval(AT_HWCAP)&HWCAP_SHA1)!=0;
+#elif defined(__ARM_FEATURE_SHA2) || defined(__ARM_FEATURE_CRYPTO)
+  return true;
+#else
+  return false;
+#endif
+}
+static const bool haveSHA1HW=detectARMSHA();
+
+// 80 rounds of SHA-1 on state (abcd, e) with a 64 byte message in
+// w[0..3], each holding 4 words, first word in lane 0. Each group of 4
+// rounds updates the oldest 4 words of the message schedule first.
+ZPAQ_ARMSHA_TARGET static inline void sha1Rounds(uint32x4_t& abcd, U32& e,
+                                                 uint32x4_t* w) {
+  static const U32 k[4]={0x5A827999, 0x6ED9EBA1, 0x8F1BBCDC, 0xCA62C1D6};
+  const uint32x4_t abcd0=abcd;
+  const U32 e0=e;
+  for (int i=0; i<20; ++i) {
+    if (i>=4)
+      w[i&3]=vsha1su1q_u32(vsha1su0q_u32(w[i&3], w[(i+1)&3], w[(i+2)&3]),
+                           w[(i+3)&3]);
+    const uint32x4_t t=vaddq_u32(w[i&3], vdupq_n_u32(k[i/5]));
+    const U32 en=vsha1h_u32(vgetq_lane_u32(abcd, 0));
+    if (i<5) abcd=vsha1cq_u32(abcd, e, t);
+    else if (i>=10 && i<15) abcd=vsha1mq_u32(abcd, e, t);
+    else abcd=vsha1pq_u32(abcd, e, t);
+    e=en;
+  }
+  abcd=vaddq_u32(abcd, abcd0);
+  e+=e0;
+}
+
+// Hash one 64 byte block already split into big-endian words w[0..15]
+ZPAQ_ARMSHA_TARGET static void sha1ProcessWords(U32* h, const U32* w) {
+  uint32x4_t abcd=vld1q_u32(h);
+  U32 e=h[4];
+  uint32x4_t m[4]={vld1q_u32(w), vld1q_u32(w+4), vld1q_u32(w+8),
+                   vld1q_u32(w+12)};
+  sha1Rounds(abcd, e, m);
+  vst1q_u32(h, abcd);
+  h[4]=e;
+}
+
+// Hash n 64 byte blocks at p
+ZPAQ_ARMSHA_TARGET static void sha1ProcessBytes(U32* h,
+    const unsigned char* p, size_t n) {
+  uint32x4_t abcd=vld1q_u32(h);
+  U32 e=h[4];
+  for (; n>0; --n, p+=64) {
+    uint32x4_t m[4];
+    for (int i=0; i<4; ++i)
+      m[i]=vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(p+16*i)));
+    sha1Rounds(abcd, e, m);
+  }
+  vst1q_u32(h, abcd);
+  h[4]=e;
+}
+
+#endif  // ZPAQ_ARMSHA
+
 // Hash buf[0..n-1]
 void SHA1::write(const char* buf, int64_t n) {
   const unsigned char* p=(const unsigned char*) buf;
   for (; n>0 && (U32(len)&511)!=0; --n) put(*p++);
-#ifdef ZPAQ_SHANI
-  if (haveSHANI && n>=64) {
+#ifdef ZPAQ_SHA1HW
+  if (haveSHA1HW && n>=64) {
     const int64_t nb=n>>6;  // number of whole blocks
     sha1ProcessBytes(h, p, size_t(nb));
     p+=nb<<6;
@@ -536,8 +633,8 @@ void SHA1::write(const char* buf, int64_t n) {
 
 // Hash 1 block of 64 bytes
 void SHA1::process() {
-#ifdef ZPAQ_SHANI
-  if (haveSHANI) {
+#ifdef ZPAQ_SHA1HW
+  if (haveSHA1HW) {
     sha1ProcessWords(h, w);
     return;
   }
@@ -1028,12 +1125,103 @@ ZPAQ_AESNI_TARGET static void aesniCTR(const U32* ek, int nr, U32 iv0,
 
 #endif  // ZPAQ_AESNI
 
+#ifdef ZPAQ_ARMAES
+
+// Return true if the CPU supports the AES instructions
+static bool detectARMAES() {
+#if defined(__APPLE__)
+  return true;
+#elif defined(__linux__)
+#ifndef HWCAP_AES
+#define HWCAP_AES (1<<3)
+#endif
+  return (getauxval(AT_HWCAP)&HWCAP_AES)!=0;
+#elif defined(__ARM_FEATURE_AES) || defined(__ARM_FEATURE_CRYPTO)
+  return true;
+#else
+  return false;
+#endif
+}
+static const bool haveARMAES=detectARMAES();
+
+// 4 words as 16 bytes, each word big-endian
+static inline uint8x16_t aesBytes(U32 w0, U32 w1, U32 w2, U32 w3) {
+  const U32 w[4]={w0, w1, w2, w3};
+  return vrev32q_u8(vld1q_u8((const uint8_t*)w));
+}
+
+// Encrypt block x with round keys rk[0..nr]. AESE adds the round key
+// before SubBytes and ShiftRows, so the last key is added apart.
+ZPAQ_ARMAES_TARGET static inline uint8x16_t aesArmBlock(uint8x16_t x,
+    const uint8x16_t* rk, int nr) {
+  for (int r=0; r<nr-1; ++r) x=vaesmcq_u8(vaeseq_u8(x, rk[r]));
+  return veorq_u8(vaeseq_u8(x, rk[nr-1]), rk[nr]);
+}
+
+// Same as aesniCTR() with the ARMv8 AES instructions
+ZPAQ_ARMAES_TARGET static void armaesCTR(const U32* ek, int nr, U32 iv0,
+    U32 iv1, char* buf, int n, U64 offset) {
+  uint8x16_t rk[15];
+  for (int r=0; r<=nr; ++r)
+    rk[r]=aesBytes(ek[4*r], ek[4*r+1], ek[4*r+2], ek[4*r+3]);
+  U64 i=offset>>4;  // counter of the block containing buf[k]
+  int k=0;          // bytes of buf done
+  uint8_t* p=(uint8_t*)buf;
+
+  // Leading partial block
+  const int lead=int(offset&15);
+  if (lead) {
+    unsigned char ct[16];
+    vst1q_u8(ct, aesArmBlock(aesBytes(iv0, iv1, U32(i>>32), U32(i)), rk,
+                             nr));
+    for (int j=lead; j<16 && k<n; ++j) buf[k++]^=ct[j];
+    ++i;
+  }
+
+  // Whole blocks, NB independent chains at a time to fill the pipeline
+  enum {NB=8};
+  while (n-k>=16*NB) {
+    uint8x16_t x[NB];
+    for (int j=0; j<NB; ++j)
+      x[j]=aesBytes(iv0, iv1, U32((i+j)>>32), U32(i+j));
+    for (int r=0; r<nr-1; ++r)
+      for (int j=0; j<NB; ++j) x[j]=vaesmcq_u8(vaeseq_u8(x[j], rk[r]));
+    for (int j=0; j<NB; ++j)
+      vst1q_u8(p+k+16*j, veorq_u8(vld1q_u8(p+k+16*j),
+               veorq_u8(vaeseq_u8(x[j], rk[nr-1]), rk[nr])));
+    k+=16*NB;
+    i+=NB;
+  }
+  while (n-k>=16) {
+    vst1q_u8(p+k, veorq_u8(vld1q_u8(p+k), aesArmBlock(
+             aesBytes(iv0, iv1, U32(i>>32), U32(i)), rk, nr)));
+    k+=16;
+    ++i;
+  }
+
+  // Trailing partial block
+  if (k<n) {
+    unsigned char ct[16];
+    vst1q_u8(ct, aesArmBlock(aesBytes(iv0, iv1, U32(i>>32), U32(i)), rk,
+                             nr));
+    for (int j=0; k<n; ++j) buf[k++]^=ct[j];
+  }
+}
+
+#endif  // ZPAQ_ARMAES
+
 // Encrypt or decrypt slice buf[0..n-1] at offset by XOR with AES(i) where
 // i is the 128 bit big-endian distance from the start in 16 byte blocks.
 void AES_CTR::encrypt(char* buf, int n, U64 offset) {
 #ifdef ZPAQ_AESNI
   if (haveAESNI) {
     aesniCTR(ek, Nr, iv0, iv1, buf, n, offset);
+    return;
+  }
+#endif
+#ifdef ZPAQ_ARMAES
+  if (haveARMAES) {
+    armaesCTR(ek, Nr, iv0, iv1, buf, n, offset);
     return;
   }
 #endif
