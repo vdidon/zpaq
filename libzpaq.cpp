@@ -3749,7 +3749,9 @@ static bool iserr(int op) {
 static int oplen(const U8* hcomp) {
   if (*hcomp==255) return 3;
   if (*hcomp%8==7) return 2;
-  if (*hcomp<51 && (*hcomp%8-1)/2==0) {  // ++ or -- opcode
+  // (op%8-1)/2==0 also held for a swap (op%8==0), so that a run of
+  // identical swaps was translated as a single one.
+  if (*hcomp<51 && (*hcomp%8==1 || *hcomp%8==2)) {  // ++ or -- opcode
     int i;
     for (i=1; i<127 && hcomp[i]==hcomp[0]; ++i);
     return i;
