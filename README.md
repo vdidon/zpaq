@@ -102,31 +102,28 @@ round to the other they varied by up to 20 %, so the small gains of `-m3` and
 
 The same data on a Raspberry Pi 5 (Cortex-A76, 4 cores, 8 GB, Debian 13,
 GCC 14.2, `-O3 -march=native`), 4 threads. Here the fork before the ARM work
-(7.16 as of commit `259662b`, already up to 25 % faster than 7.15 on ARM) is
+(7.16 as of commit `2a4e87b`, already up to 25 % faster than 7.15 on ARM) is
 compared with the current one, which adds the AArch64 JIT, NEON and the ARMv8
 Crypto Extension.
 
-| Method | Operation | `259662b` | Fork    | Speed-up |
+| Method | Operation | `2a4e87b` | Fork    | Speed-up |
 |--------|-----------|----------:|--------:|---------:|
-| `-m1`  | add       |    9.3 s  |   9.2 s |    ×1.01 |
-|        | extract   |   18.2 s  |   2.0 s |    ×9.33 |
-| `-m2`  | add       |   70.7 s  |  70.5 s |    ×1.00 |
-|        | extract   |   20.0 s  |   2.2 s |    ×9.27 |
-| `-m3`  | add       |   97.0 s  |  87.3 s |    ×1.11 |
-|        | extract   |   74.4 s  |  45.2 s |    ×1.65 |
-| `-m4`  | add       |  257.2 s  | 185.8 s |    ×1.38 |
-|        | extract   |  265.5 s  | 192.1 s |    ×1.38 |
-| `-m5`  | add       |  907.8 s  | 584.2 s |    ×1.55 |
-|        | extract   |  906.2 s  | 587.6 s |    ×1.54 |
+| `-m1`  | add       |    9.3 s  |   9.2 s |    ×1.00 |
+|        | extract   |   18.2 s  |   1.9 s |    ×9.53 |
+| `-m2`  | add       |   70.6 s  |  70.3 s |    ×1.00 |
+|        | extract   |   19.6 s  |   2.2 s |    ×9.08 |
+| `-m3`  | add       |   95.4 s  |  85.5 s |    ×1.11 |
+|        | extract   |   72.0 s  |  44.5 s |    ×1.62 |
+| `-m4`  | add       |  239.4 s  | 176.4 s |    ×1.36 |
+|        | extract   |  246.3 s  | 181.1 s |    ×1.36 |
+| `-m5`  | add       |  846.1 s  | 553.7 s |    ×1.53 |
+|        | extract   |  839.5 s  | 553.3 s |    ×1.52 |
 
 Best of two rounds, the two versions taking turns; the rounds agreed within
-6 %. The archives have the same size and each version extracts the archives of
-the other. The Pi was not running at full speed: set to 3.0 GHz with a fan, it
-ran mostly at 2.7 to 2.9 GHz under its soft temperature limit (about 68 °C),
-5 % of the time at 1.5 GHz, and its power supply reported under-voltage. Both
-versions ran under the same conditions, so the ratios hold better than the
-absolute times. Compressing with `-m1` and `-m2` is bound by memory, where the
-ARM code brings nothing.
+1.5 %. The archives have the same size and each version extracts the archives
+of the other. The Pi was overclocked to 3.0 GHz, with a fan, and ran at that
+frequency the whole time, at 70 °C at most. Compressing with `-m1` and `-m2` is
+bound by memory, where the ARM code brings nothing.
 
 ## Building
 
