@@ -2706,6 +2706,46 @@ void Predictor::prefetchByte() {
   prefetchNext(1, 1);
 }
 
+// Dot product of the MIX weights wt[0..m-1], each scaled down by 8 bits,
+// with the inputs x[0..m-1]. Exact in 32 bits in any order of summation:
+// |wt[j]>>8| <= 2048, |x[j]| < 2048 and m < 256.
+static inline int mixDot(const int* wt, const int* x, int m) {
+  int s=0, j=0;
+#ifdef ZPAQ_NEON
+  int32x4_t s0=vdupq_n_s32(0), s1=vdupq_n_s32(0);
+  for (; j+8<=m; j+=8) {
+    s0=vmlaq_s32(s0, vshrq_n_s32(vld1q_s32(wt+j), 8), vld1q_s32(x+j));
+    s1=vmlaq_s32(s1, vshrq_n_s32(vld1q_s32(wt+j+4), 8), vld1q_s32(x+j+4));
+  }
+  if (j+4<=m) {
+    s0=vmlaq_s32(s0, vshrq_n_s32(vld1q_s32(wt+j), 8), vld1q_s32(x+j));
+    j+=4;
+  }
+  s=vaddvq_s32(vaddq_s32(s0, s1));
+#endif
+  for (; j<m; ++j) s+=(wt[j]>>8)*x[j];
+  return s;
+}
+
+// Train the MIX weights wt[0..m-1] on the inputs x[0..m-1] with the scaled
+// error err: |err| < 2^19 so err*x[j] fits in 32 bits.
+static inline void mixTrain(int* wt, const int* x, int m, int err) {
+  int j=0;
+#ifdef ZPAQ_NEON
+  const int32x4_t e=vdupq_n_s32(err), rnd=vdupq_n_s32(1<<12);
+  const int32x4_t lo=vdupq_n_s32(-(1<<19)), hi=vdupq_n_s32((1<<19)-1);
+  for (; j+4<=m; j+=4) {
+    const int32x4_t d=vshrq_n_s32(vmlaq_s32(rnd, e, vld1q_s32(x+j)), 13);
+    vst1q_s32(wt+j,
+              vminq_s32(vmaxq_s32(vaddq_s32(vld1q_s32(wt+j), d), lo), hi));
+  }
+#endif
+  for (; j<m; ++j) {
+    const int w=wt[j]+((err*x[j]+(1<<12))>>13);
+    wt[j]=w<-(1<<19) ? -(1<<19) : w>=(1<<19) ? (1<<19)-1 : w;
+  }
+}
+
 // Return next bit prediction using interpreted COMP code
 int Predictor::predict0() {
   assert(initTables);
@@ -2766,11 +2806,8 @@ int Predictor::predict0() {
         cr.cxt=h[i]+(c8&cp[5]);
         cr.cxt=(cr.cxt&(cr.c-1))*m; // pointer to row of weights
         assert(cr.cxt<=cr.cm.size()-m);
-        int* wt=(int*)&cr.cm[cr.cxt];
-        p[i]=0;
-        for (int j=0; j<m; ++j)
-          p[i]+=(wt[j]>>8)*p[cp[2]+j];
-        p[i]=clamp2k(p[i]>>8);
+        const int* wt=(const int*)&cr.cm[cr.cxt];
+        p[i]=clamp2k(mixDot(wt, &p[cp[2]], m)>>8);
       }
         break;
       case ISSE: { // sizebits j -- c=hi, cxt=bh
@@ -2888,9 +2925,7 @@ void Predictor::update0(int y) {
         assert(cr.cm.size()==m*cr.c);
         assert(cr.cxt+m<=cr.cm.size());
         int err=(y*32767-squash(p[i]))*cp[4]>>4;
-        int* wt=(int*)&cr.cm[cr.cxt];
-        for (int j=0; j<m; ++j)
-          wt[j]=clamp512k(wt[j]+((err*p[cp[2]+j]+(1<<12))>>13));
+        mixTrain((int*)&cr.cm[cr.cxt], &p[cp[2]], m, err);
       }
         break;
       case ISSE: { // sizebits j  -- c=hi, cxt=bh
