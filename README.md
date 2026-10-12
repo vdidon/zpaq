@@ -29,26 +29,31 @@ Run `zpaq` without arguments for a summary of the commands and options.
 
 ### Compression (libzpaq)
 
-- Context mixing (`-m3` to `-m5`): the JIT-compiled model prefetches the table
-  rows of the next bit before updating, mixes and updates the MIX weights 4 at
-  a time with SSE4.1 or 8 at a time with AVX2, and runs `update()` and the next
-  `predict()` in one call.
-- LZ77 (`-m1`, `-m2`): SSE2 filtering of hash buckets, prefetching of buckets
-  and match candidates, word compares, and a bit writer that packs whole codes.
-- SHA-1 with the x86 SHA extensions, AES with AES-NI (`-key`).
-- Windows: model tables of 4 MiB or more are allocated in large pages when the
-  user holds the "Lock pages in memory" privilege.
-- 64-bit ARM (Linux): a JIT compiles ZPAQL and the context model to AArch64
-  code, as the x86 JIT does, with the MIX weights mixed and updated 4 at a
-  time with NEON. SHA-1 and AES use the ARMv8 Crypto Extension, and LZ77
-  filters hash buckets with NEON.
-- Without a JIT (other processors, or `-DNOJIT`), the ZPAQL interpreter keeps
-  the machine registers in locals and dispatches through a table of labels,
-  which makes it about twice as fast.
-- The JIT translated a run of identical swap instructions (ZPAQL `x<>a`) as a
-  single swap. It now follows the specification, like the interpreter. The
-  built-in methods never write such runs, only hand-written configurations
-  can.
+- x86
+  - Context mixing (`-m3` to `-m5`): the JIT-compiled model prefetches the
+    table rows of the next bit before updating, mixes and updates the MIX
+    weights 4 at a time with SSE4.1 or 8 at a time with AVX2, and runs
+    `update()` and the next `predict()` in one call.
+  - LZ77 (`-m1`, `-m2`): SSE2 filtering of hash buckets, prefetching of
+    buckets and match candidates, word compares, and a bit writer that packs
+    whole codes.
+  - SHA-1 with the x86 SHA extensions, AES with AES-NI (`-key`).
+  - Windows: model tables of 4 MiB or more are allocated in large pages when
+    the user holds the "Lock pages in memory" privilege.
+- 64-bit ARM
+  - Linux: a JIT compiles ZPAQL and the context model to AArch64 code, as the
+    x86 JIT does, with the MIX weights mixed and updated 4 at a time with
+    NEON.
+  - LZ77 (`-m1`, `-m2`): NEON filtering of hash buckets.
+  - SHA-1 and AES (`-key`) with the ARMv8 Crypto Extension.
+- All processors
+  - Without a JIT (other processors, or `-DNOJIT`), the ZPAQL interpreter
+    keeps the machine registers in locals and dispatches through a table of
+    labels, which makes it about twice as fast.
+  - The JIT translated a run of identical swap instructions (ZPAQL `x<>a`) as
+    a single swap. It now follows the specification, like the interpreter.
+    The built-in methods never write such runs, only hand-written
+    configurations can.
 
 All instruction set extensions are detected at run time, with a fallback to
 the original code.
@@ -69,6 +74,8 @@ the original code.
   data with long and far LZ77 matches.
 
 ## Performance
+
+### x86
 
 zpaq 7.15 against this fork, both built from source with the same compiler and
 options (GCC 14.2, `-O3 -march=native`, static). The data is a MinGW-w64
