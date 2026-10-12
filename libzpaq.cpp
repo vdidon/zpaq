@@ -53,13 +53,19 @@ See libzpaq.h for additional documentation.
 #define ZPAQ_PREFETCH_BARRIER() ((void)0)
 #endif
 
-// SSE2 is used to test a row of the LZ77 hash table at once
+// SSE2 or NEON is used to test a row of the LZ77 hash table at once
 #if defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64)
 #define ZPAQ_LZ_SSE2 1
 #include <emmintrin.h>
 #elif defined(_M_IX86_FP) && _M_IX86_FP>=2
 #define ZPAQ_LZ_SSE2 1
 #include <emmintrin.h>
+#elif defined(__aarch64__)
+#define ZPAQ_NEON 1  // and NEON on 64-bit ARM
+#include <arm_neon.h>
+#endif
+#if defined(ZPAQ_LZ_SSE2) || defined(ZPAQ_NEON)
+#define ZPAQ_LZ_ROW 1
 #endif
 
 // SHA-1 hardware acceleration using x86 SHA extensions, selected at run
@@ -7608,6 +7614,22 @@ static inline unsigned rowMatches(const unsigned* row, unsigned mask,
   return _mm_movemask_ps(_mm_castsi128_ps(e0))
       |(_mm_movemask_ps(_mm_castsi128_ps(e1))<<4);
 }
+#elif defined(ZPAQ_NEON)
+static inline unsigned rowMatches(const unsigned* row, unsigned mask,
+                                  unsigned cb) {
+  const uint32x4_t vmask=vdupq_n_u32(mask);
+  const uint32x4_t vcb=vdupq_n_u32(cb);
+  const uint32x4_t m0=vld1q_u32(row);
+  const uint32x4_t m1=vld1q_u32(row+4);
+  const uint32x4_t e0=vandq_u32(vtstq_u32(m0, m0),
+      vceqq_u32(vandq_u32(m0, vmask), vcb));
+  const uint32x4_t e1=vandq_u32(vtstq_u32(m1, m1),
+      vceqq_u32(vandq_u32(m1, vmask), vcb));
+  // No movemask: narrow the lanes to bytes, keep bit k in byte k, add
+  static const uint8_t bit[8]={1, 2, 4, 8, 16, 32, 64, 128};
+  const uint8x8_t e=vmovn_u16(vcombine_u16(vmovn_u32(e0), vmovn_u32(e1)));
+  return vaddv_u8(vand_u8(e, vld1_u8(bit)));
+}
 #endif
 
 // Bit output for level 1 LZ77 codes, LSB first. The state is copied
@@ -7956,9 +7978,11 @@ void LZBuffer::fill() {
       if ((!mm2 || blen<mm2) && ii+3<nn) {
         const unsigned cb=inp[ii+3]&mask;  // confirmation byte
         const unsigned limit=MIN(maxm, nn-ii);
-#ifdef ZPAQ_LZ_SSE2
+#ifdef ZPAQ_LZ_ROW
         // Prefetch the input at the candidates of the position CAND_DIST
-        // ahead, whose hash table row was prefetched earlier
+        // ahead, whose hash table row was prefetched earlier. Measured
+        // slower on Cortex-A76 (Raspberry Pi 5), so x86 only.
+#ifdef ZPAQ_LZ_SSE2
         if (bk<=7 && ii+CAND_DIST+mmb<nn) {
           const unsigned hf=hring[(ii+CAND_DIST)&(PREFETCH_DIST-1)];
           const unsigned* rowf=htp+(hf&~7u);
@@ -7969,6 +7993,7 @@ void LZBuffer::fill() {
             ZPAQ_PREFETCH(inp+(rowf[j]>>cbits));
           }
         }
+#endif
         // Test the 8 entries of the aligned group holding ht[h1^0..7]
         // at once, then visit the candidates in the order k=0..bucket
         if (bk<=7) {
