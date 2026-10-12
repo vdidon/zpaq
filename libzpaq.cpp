@@ -1501,7 +1501,13 @@ void ZPAQL::init(int hbits, int mbits) {
   a=b=c=d=pc=f=0;
 }
 
-// Run program on input by interpreting header
+// Run program on input by interpreting header. The machine state lives
+// in locals for the whole run, so that it stays in registers, rather than
+// in members reloaded after every store to M or H. With g++ or clang each
+// instruction jumps to the next one through a table of label addresses
+// (one indirect branch per opcode, which predicts better than the single
+// one of a switch). Without JIT this loop is the whole decompression time
+// of -m1 and -m2 and the context hashing of the other methods.
 void ZPAQL::run0(U32 input) {
   assert(cend>6);
   assert(hbegin>=cend+128);
@@ -1510,9 +1516,295 @@ void ZPAQL::run0(U32 input) {
   assert(m.size()>0);
   assert(h.size()>0);
   assert(header[0]+256*header[1]==cend+hend-hbegin-2);
-  pc=hbegin;
-  a=input;
-  while (execute()) ;
+  const U8* hp=&header[0];
+  U8* mp=&m[0];
+  const U32 mm=U32(m.size()-1);
+  U32* hh=&h[0];
+  const U32 hm=U32(h.size()-1);
+  U32* rr=&r[0];
+  const int hbegin=this->hbegin, hend=this->hend;
+  U32 a=input, b=this->b, c=this->c, d=this->d;
+  int f=this->f, pc=hbegin;
+#define ZM(x) mp[(x)&mm]
+#define ZH(x) hh[(x)&hm]
+#define ZSWAP(x) do {U32& q_=(x); const U32 t_=q_; q_=a; a=t_;} while (0)
+#define ZSWAP8(x) do {U8& q_=(x); const U32 t_=q_; q_=U8(a); \
+                      a=(a&~255u)|t_;} while (0)
+#define ZDIV(x) do {const U32 t_=(x); if (t_) a/=t_; else a=0;} while (0)
+#define ZMOD(x) do {const U32 t_=(x); if (t_) a%=t_; else a=0;} while (0)
+#if defined(__GNUC__) || defined(__clang__)
+#define ZCASE(n) op##n:
+#define ZNEXT goto *ops[hp[pc++]]
+    static void* const ops[256]={
+      &&op0, &&op1, &&op2, &&op3, &&op4, &&opbad, &&opbad, &&op7,
+      &&op8, &&op9, &&op10, &&op11, &&op12, &&opbad, &&opbad, &&op15,
+      &&op16, &&op17, &&op18, &&op19, &&op20, &&opbad, &&opbad, &&op23,
+      &&op24, &&op25, &&op26, &&op27, &&op28, &&opbad, &&opbad, &&op31,
+      &&op32, &&op33, &&op34, &&op35, &&op36, &&opbad, &&opbad, &&op39,
+      &&op40, &&op41, &&op42, &&op43, &&op44, &&opbad, &&opbad, &&op47,
+      &&op48, &&op49, &&op50, &&op51, &&op52, &&opbad, &&opbad, &&op55,
+      &&op56, &&op57, &&opbad, &&op59, &&op60, &&opbad, &&opbad, &&op63,
+      &&op64, &&op65, &&op66, &&op67, &&op68, &&op69, &&op70, &&op71,
+      &&op72, &&op73, &&op74, &&op75, &&op76, &&op77, &&op78, &&op79,
+      &&op80, &&op81, &&op82, &&op83, &&op84, &&op85, &&op86, &&op87,
+      &&op88, &&op89, &&op90, &&op91, &&op92, &&op93, &&op94, &&op95,
+      &&op96, &&op97, &&op98, &&op99, &&op100, &&op101, &&op102, &&op103,
+      &&op104, &&op105, &&op106, &&op107, &&op108, &&op109, &&op110, &&op111,
+      &&op112, &&op113, &&op114, &&op115, &&op116, &&op117, &&op118, &&op119,
+      &&opbad, &&opbad, &&opbad, &&opbad, &&opbad, &&opbad, &&opbad, &&opbad,
+      &&op128, &&op129, &&op130, &&op131, &&op132, &&op133, &&op134, &&op135,
+      &&op136, &&op137, &&op138, &&op139, &&op140, &&op141, &&op142, &&op143,
+      &&op144, &&op145, &&op146, &&op147, &&op148, &&op149, &&op150, &&op151,
+      &&op152, &&op153, &&op154, &&op155, &&op156, &&op157, &&op158, &&op159,
+      &&op160, &&op161, &&op162, &&op163, &&op164, &&op165, &&op166, &&op167,
+      &&op168, &&op169, &&op170, &&op171, &&op172, &&op173, &&op174, &&op175,
+      &&op176, &&op177, &&op178, &&op179, &&op180, &&op181, &&op182, &&op183,
+      &&op184, &&op185, &&op186, &&op187, &&op188, &&op189, &&op190, &&op191,
+      &&op192, &&op193, &&op194, &&op195, &&op196, &&op197, &&op198, &&op199,
+      &&op200, &&op201, &&op202, &&op203, &&op204, &&op205, &&op206, &&op207,
+      &&op208, &&op209, &&op210, &&op211, &&op212, &&op213, &&op214, &&op215,
+      &&op216, &&op217, &&op218, &&op219, &&op220, &&op221, &&op222, &&op223,
+      &&op224, &&op225, &&op226, &&op227, &&op228, &&op229, &&op230, &&op231,
+      &&op232, &&op233, &&op234, &&op235, &&op236, &&op237, &&op238, &&op239,
+      &&opbad, &&opbad, &&opbad, &&opbad, &&opbad, &&opbad, &&opbad, &&opbad,
+      &&opbad, &&opbad, &&opbad, &&opbad, &&opbad, &&opbad, &&opbad, &&op255};
+  ZNEXT;
+  {
+#else
+#define ZCASE(n) case n:
+#define ZNEXT continue
+  for (;;) switch (hp[pc++]) {
+    default: goto opbad;
+#endif
+    ZCASE(0) err(); ZNEXT;  // ERROR
+    ZCASE(1) ++a; ZNEXT;  // A++
+    ZCASE(2) --a; ZNEXT;  // A--
+    ZCASE(3) a = ~a; ZNEXT;  // A!
+    ZCASE(4) a = 0; ZNEXT;  // A=0
+    ZCASE(7) a = rr[hp[pc++]]; ZNEXT;  // A=R N
+    ZCASE(8) ZSWAP(b); ZNEXT;  // B<>A
+    ZCASE(9) ++b; ZNEXT;  // B++
+    ZCASE(10) --b; ZNEXT;  // B--
+    ZCASE(11) b = ~b; ZNEXT;  // B!
+    ZCASE(12) b = 0; ZNEXT;  // B=0
+    ZCASE(15) b = rr[hp[pc++]]; ZNEXT;  // B=R N
+    ZCASE(16) ZSWAP(c); ZNEXT;  // C<>A
+    ZCASE(17) ++c; ZNEXT;  // C++
+    ZCASE(18) --c; ZNEXT;  // C--
+    ZCASE(19) c = ~c; ZNEXT;  // C!
+    ZCASE(20) c = 0; ZNEXT;  // C=0
+    ZCASE(23) c = rr[hp[pc++]]; ZNEXT;  // C=R N
+    ZCASE(24) ZSWAP(d); ZNEXT;  // D<>A
+    ZCASE(25) ++d; ZNEXT;  // D++
+    ZCASE(26) --d; ZNEXT;  // D--
+    ZCASE(27) d = ~d; ZNEXT;  // D!
+    ZCASE(28) d = 0; ZNEXT;  // D=0
+    ZCASE(31) d = rr[hp[pc++]]; ZNEXT;  // D=R N
+    ZCASE(32) ZSWAP8(ZM(b)); ZNEXT;  // *B<>A
+    ZCASE(33) ++ZM(b); ZNEXT;  // *B++
+    ZCASE(34) --ZM(b); ZNEXT;  // *B--
+    ZCASE(35) ZM(b) = ~ZM(b); ZNEXT;  // *B!
+    ZCASE(36) ZM(b) = 0; ZNEXT;  // *B=0
+    ZCASE(39) if (f) pc+=((hp[pc]+128)&255)-127; else ++pc; ZNEXT;  // JT N
+    ZCASE(40) ZSWAP8(ZM(c)); ZNEXT;  // *C<>A
+    ZCASE(41) ++ZM(c); ZNEXT;  // *C++
+    ZCASE(42) --ZM(c); ZNEXT;  // *C--
+    ZCASE(43) ZM(c) = ~ZM(c); ZNEXT;  // *C!
+    ZCASE(44) ZM(c) = 0; ZNEXT;  // *C=0
+    ZCASE(47) if (!f) pc+=((hp[pc]+128)&255)-127; else ++pc; ZNEXT;  // JF N
+    ZCASE(48) ZSWAP(ZH(d)); ZNEXT;  // *D<>A
+    ZCASE(49) ++ZH(d); ZNEXT;  // *D++
+    ZCASE(50) --ZH(d); ZNEXT;  // *D--
+    ZCASE(51) ZH(d) = ~ZH(d); ZNEXT;  // *D!
+    ZCASE(52) ZH(d) = 0; ZNEXT;  // *D=0
+    ZCASE(55) rr[hp[pc++]] = a; ZNEXT;  // R=A N
+    ZCASE(56) goto halt;  // HALT
+    ZCASE(57) outc(a&255); ZNEXT;  // OUT
+    ZCASE(59) a = (a+ZM(b)+512)*773; ZNEXT;  // HASH
+    ZCASE(60) ZH(d) = (ZH(d)+a+512)*773; ZNEXT;  // HASHD
+    ZCASE(63) pc+=((hp[pc]+128)&255)-127; ZNEXT;  // JMP N
+    ZCASE(64) ZNEXT;  // A=A
+    ZCASE(65) a = b; ZNEXT;  // A=B
+    ZCASE(66) a = c; ZNEXT;  // A=C
+    ZCASE(67) a = d; ZNEXT;  // A=D
+    ZCASE(68) a = ZM(b); ZNEXT;  // A=*B
+    ZCASE(69) a = ZM(c); ZNEXT;  // A=*C
+    ZCASE(70) a = ZH(d); ZNEXT;  // A=*D
+    ZCASE(71) a = hp[pc++]; ZNEXT;  // A= N
+    ZCASE(72) b = a; ZNEXT;  // B=A
+    ZCASE(73) ZNEXT;  // B=B
+    ZCASE(74) b = c; ZNEXT;  // B=C
+    ZCASE(75) b = d; ZNEXT;  // B=D
+    ZCASE(76) b = ZM(b); ZNEXT;  // B=*B
+    ZCASE(77) b = ZM(c); ZNEXT;  // B=*C
+    ZCASE(78) b = ZH(d); ZNEXT;  // B=*D
+    ZCASE(79) b = hp[pc++]; ZNEXT;  // B= N
+    ZCASE(80) c = a; ZNEXT;  // C=A
+    ZCASE(81) c = b; ZNEXT;  // C=B
+    ZCASE(82) ZNEXT;  // C=C
+    ZCASE(83) c = d; ZNEXT;  // C=D
+    ZCASE(84) c = ZM(b); ZNEXT;  // C=*B
+    ZCASE(85) c = ZM(c); ZNEXT;  // C=*C
+    ZCASE(86) c = ZH(d); ZNEXT;  // C=*D
+    ZCASE(87) c = hp[pc++]; ZNEXT;  // C= N
+    ZCASE(88) d = a; ZNEXT;  // D=A
+    ZCASE(89) d = b; ZNEXT;  // D=B
+    ZCASE(90) d = c; ZNEXT;  // D=C
+    ZCASE(91) ZNEXT;  // D=D
+    ZCASE(92) d = ZM(b); ZNEXT;  // D=*B
+    ZCASE(93) d = ZM(c); ZNEXT;  // D=*C
+    ZCASE(94) d = ZH(d); ZNEXT;  // D=*D
+    ZCASE(95) d = hp[pc++]; ZNEXT;  // D= N
+    ZCASE(96) ZM(b) = a; ZNEXT;  // *B=A
+    ZCASE(97) ZM(b) = b; ZNEXT;  // *B=B
+    ZCASE(98) ZM(b) = c; ZNEXT;  // *B=C
+    ZCASE(99) ZM(b) = d; ZNEXT;  // *B=D
+    ZCASE(100) ZNEXT;  // *B=*B
+    ZCASE(101) ZM(b) = ZM(c); ZNEXT;  // *B=*C
+    ZCASE(102) ZM(b) = ZH(d); ZNEXT;  // *B=*D
+    ZCASE(103) ZM(b) = hp[pc++]; ZNEXT;  // *B= N
+    ZCASE(104) ZM(c) = a; ZNEXT;  // *C=A
+    ZCASE(105) ZM(c) = b; ZNEXT;  // *C=B
+    ZCASE(106) ZM(c) = c; ZNEXT;  // *C=C
+    ZCASE(107) ZM(c) = d; ZNEXT;  // *C=D
+    ZCASE(108) ZM(c) = ZM(b); ZNEXT;  // *C=*B
+    ZCASE(109) ZNEXT;  // *C=*C
+    ZCASE(110) ZM(c) = ZH(d); ZNEXT;  // *C=*D
+    ZCASE(111) ZM(c) = hp[pc++]; ZNEXT;  // *C= N
+    ZCASE(112) ZH(d) = a; ZNEXT;  // *D=A
+    ZCASE(113) ZH(d) = b; ZNEXT;  // *D=B
+    ZCASE(114) ZH(d) = c; ZNEXT;  // *D=C
+    ZCASE(115) ZH(d) = d; ZNEXT;  // *D=D
+    ZCASE(116) ZH(d) = ZM(b); ZNEXT;  // *D=*B
+    ZCASE(117) ZH(d) = ZM(c); ZNEXT;  // *D=*C
+    ZCASE(118) ZNEXT;  // *D=*D
+    ZCASE(119) ZH(d) = hp[pc++]; ZNEXT;  // *D= N
+    ZCASE(128) a += a; ZNEXT;  // A+=A
+    ZCASE(129) a += b; ZNEXT;  // A+=B
+    ZCASE(130) a += c; ZNEXT;  // A+=C
+    ZCASE(131) a += d; ZNEXT;  // A+=D
+    ZCASE(132) a += ZM(b); ZNEXT;  // A+=*B
+    ZCASE(133) a += ZM(c); ZNEXT;  // A+=*C
+    ZCASE(134) a += ZH(d); ZNEXT;  // A+=*D
+    ZCASE(135) a += hp[pc++]; ZNEXT;  // A+= N
+    ZCASE(136) a -= a; ZNEXT;  // A-=A
+    ZCASE(137) a -= b; ZNEXT;  // A-=B
+    ZCASE(138) a -= c; ZNEXT;  // A-=C
+    ZCASE(139) a -= d; ZNEXT;  // A-=D
+    ZCASE(140) a -= ZM(b); ZNEXT;  // A-=*B
+    ZCASE(141) a -= ZM(c); ZNEXT;  // A-=*C
+    ZCASE(142) a -= ZH(d); ZNEXT;  // A-=*D
+    ZCASE(143) a -= hp[pc++]; ZNEXT;  // A-= N
+    ZCASE(144) a *= a; ZNEXT;  // A*=A
+    ZCASE(145) a *= b; ZNEXT;  // A*=B
+    ZCASE(146) a *= c; ZNEXT;  // A*=C
+    ZCASE(147) a *= d; ZNEXT;  // A*=D
+    ZCASE(148) a *= ZM(b); ZNEXT;  // A*=*B
+    ZCASE(149) a *= ZM(c); ZNEXT;  // A*=*C
+    ZCASE(150) a *= ZH(d); ZNEXT;  // A*=*D
+    ZCASE(151) a *= hp[pc++]; ZNEXT;  // A*= N
+    ZCASE(152) ZDIV(a); ZNEXT;  // A/=A
+    ZCASE(153) ZDIV(b); ZNEXT;  // A/=B
+    ZCASE(154) ZDIV(c); ZNEXT;  // A/=C
+    ZCASE(155) ZDIV(d); ZNEXT;  // A/=D
+    ZCASE(156) ZDIV(ZM(b)); ZNEXT;  // A/=*B
+    ZCASE(157) ZDIV(ZM(c)); ZNEXT;  // A/=*C
+    ZCASE(158) ZDIV(ZH(d)); ZNEXT;  // A/=*D
+    ZCASE(159) ZDIV(hp[pc++]); ZNEXT;  // A/= N
+    ZCASE(160) ZMOD(a); ZNEXT;  // A%=A
+    ZCASE(161) ZMOD(b); ZNEXT;  // A%=B
+    ZCASE(162) ZMOD(c); ZNEXT;  // A%=C
+    ZCASE(163) ZMOD(d); ZNEXT;  // A%=D
+    ZCASE(164) ZMOD(ZM(b)); ZNEXT;  // A%=*B
+    ZCASE(165) ZMOD(ZM(c)); ZNEXT;  // A%=*C
+    ZCASE(166) ZMOD(ZH(d)); ZNEXT;  // A%=*D
+    ZCASE(167) ZMOD(hp[pc++]); ZNEXT;  // A%= N
+    ZCASE(168) a &= a; ZNEXT;  // A&=A
+    ZCASE(169) a &= b; ZNEXT;  // A&=B
+    ZCASE(170) a &= c; ZNEXT;  // A&=C
+    ZCASE(171) a &= d; ZNEXT;  // A&=D
+    ZCASE(172) a &= ZM(b); ZNEXT;  // A&=*B
+    ZCASE(173) a &= ZM(c); ZNEXT;  // A&=*C
+    ZCASE(174) a &= ZH(d); ZNEXT;  // A&=*D
+    ZCASE(175) a &= hp[pc++]; ZNEXT;  // A&= N
+    ZCASE(176) a &= ~ a; ZNEXT;  // A&~A
+    ZCASE(177) a &= ~ b; ZNEXT;  // A&~B
+    ZCASE(178) a &= ~ c; ZNEXT;  // A&~C
+    ZCASE(179) a &= ~ d; ZNEXT;  // A&~D
+    ZCASE(180) a &= ~ ZM(b); ZNEXT;  // A&~*B
+    ZCASE(181) a &= ~ ZM(c); ZNEXT;  // A&~*C
+    ZCASE(182) a &= ~ ZH(d); ZNEXT;  // A&~*D
+    ZCASE(183) a &= ~ hp[pc++]; ZNEXT;  // A&~ N
+    ZCASE(184) a |= a; ZNEXT;  // A|=A
+    ZCASE(185) a |= b; ZNEXT;  // A|=B
+    ZCASE(186) a |= c; ZNEXT;  // A|=C
+    ZCASE(187) a |= d; ZNEXT;  // A|=D
+    ZCASE(188) a |= ZM(b); ZNEXT;  // A|=*B
+    ZCASE(189) a |= ZM(c); ZNEXT;  // A|=*C
+    ZCASE(190) a |= ZH(d); ZNEXT;  // A|=*D
+    ZCASE(191) a |= hp[pc++]; ZNEXT;  // A|= N
+    ZCASE(192) a ^= a; ZNEXT;  // A^=A
+    ZCASE(193) a ^= b; ZNEXT;  // A^=B
+    ZCASE(194) a ^= c; ZNEXT;  // A^=C
+    ZCASE(195) a ^= d; ZNEXT;  // A^=D
+    ZCASE(196) a ^= ZM(b); ZNEXT;  // A^=*B
+    ZCASE(197) a ^= ZM(c); ZNEXT;  // A^=*C
+    ZCASE(198) a ^= ZH(d); ZNEXT;  // A^=*D
+    ZCASE(199) a ^= hp[pc++]; ZNEXT;  // A^= N
+    ZCASE(200) a <<= (a&31); ZNEXT;  // A<<=A
+    ZCASE(201) a <<= (b&31); ZNEXT;  // A<<=B
+    ZCASE(202) a <<= (c&31); ZNEXT;  // A<<=C
+    ZCASE(203) a <<= (d&31); ZNEXT;  // A<<=D
+    ZCASE(204) a <<= (ZM(b)&31); ZNEXT;  // A<<=*B
+    ZCASE(205) a <<= (ZM(c)&31); ZNEXT;  // A<<=*C
+    ZCASE(206) a <<= (ZH(d)&31); ZNEXT;  // A<<=*D
+    ZCASE(207) a <<= (hp[pc++]&31); ZNEXT;  // A<<= N
+    ZCASE(208) a >>= (a&31); ZNEXT;  // A>>=A
+    ZCASE(209) a >>= (b&31); ZNEXT;  // A>>=B
+    ZCASE(210) a >>= (c&31); ZNEXT;  // A>>=C
+    ZCASE(211) a >>= (d&31); ZNEXT;  // A>>=D
+    ZCASE(212) a >>= (ZM(b)&31); ZNEXT;  // A>>=*B
+    ZCASE(213) a >>= (ZM(c)&31); ZNEXT;  // A>>=*C
+    ZCASE(214) a >>= (ZH(d)&31); ZNEXT;  // A>>=*D
+    ZCASE(215) a >>= (hp[pc++]&31); ZNEXT;  // A>>= N
+    ZCASE(216) f = 1; ZNEXT;  // A==A
+    ZCASE(217) f = (a == b); ZNEXT;  // A==B
+    ZCASE(218) f = (a == c); ZNEXT;  // A==C
+    ZCASE(219) f = (a == d); ZNEXT;  // A==D
+    ZCASE(220) f = (a == U32(ZM(b))); ZNEXT;  // A==*B
+    ZCASE(221) f = (a == U32(ZM(c))); ZNEXT;  // A==*C
+    ZCASE(222) f = (a == ZH(d)); ZNEXT;  // A==*D
+    ZCASE(223) f = (a == U32(hp[pc++])); ZNEXT;  // A== N
+    ZCASE(224) f = 0; ZNEXT;  // A<A
+    ZCASE(225) f = (a < b); ZNEXT;  // A<B
+    ZCASE(226) f = (a < c); ZNEXT;  // A<C
+    ZCASE(227) f = (a < d); ZNEXT;  // A<D
+    ZCASE(228) f = (a < U32(ZM(b))); ZNEXT;  // A<*B
+    ZCASE(229) f = (a < U32(ZM(c))); ZNEXT;  // A<*C
+    ZCASE(230) f = (a < ZH(d)); ZNEXT;  // A<*D
+    ZCASE(231) f = (a < U32(hp[pc++])); ZNEXT;  // A< N
+    ZCASE(232) f = 0; ZNEXT;  // A>A
+    ZCASE(233) f = (a > b); ZNEXT;  // A>B
+    ZCASE(234) f = (a > c); ZNEXT;  // A>C
+    ZCASE(235) f = (a > d); ZNEXT;  // A>D
+    ZCASE(236) f = (a > U32(ZM(b))); ZNEXT;  // A>*B
+    ZCASE(237) f = (a > U32(ZM(c))); ZNEXT;  // A>*C
+    ZCASE(238) f = (a > ZH(d)); ZNEXT;  // A>*D
+    ZCASE(239) f = (a > U32(hp[pc++])); ZNEXT;  // A> N
+    ZCASE(255) if ((pc=hbegin+hp[pc]+256*hp[pc+1])>=hend) err(); ZNEXT;  //LJ
+  }
+opbad:
+  err();
+halt:
+  this->a=a, this->b=b, this->c=c, this->d=d, this->f=f, this->pc=pc;
+#undef ZM
+#undef ZH
+#undef ZSWAP
+#undef ZSWAP8
+#undef ZDIV
+#undef ZMOD
+#undef ZCASE
+#undef ZNEXT
 }
 
 // Execute one instruction, return 0 after HALT else 1
