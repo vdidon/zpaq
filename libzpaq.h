@@ -16,7 +16,8 @@ and link to libzpaq.cpp (and advapi32.lib in Windows/VC++).
 libzpaq recognizes the following options:
 
   -DDEBUG   Turn on assertion checks (slower).
-  -DNOJIT   Don't assume x86-32 or x86-64 with SSE2 (slower).
+  -DNOJIT   Don't compile ZPAQL to x86-32, x86-64 with SSE2 or AArch64
+            (Linux) code (slower). Automatic on other processors.
   -Dunix    Without -DNOJIT, assume Unix (Linux, Mac) rather than Windows.
 
 The application must provide an error handling function and derived
@@ -718,8 +719,8 @@ If there are input errors, then error() will report the error. If the
 string contains newlines, it will report the line number of the error.
 
 ZPAQL is compiled internally into a byte code, and then to native x86
-32 or 64 bit code (unless compiled with -DNOJIT, in which case the
-byte code is interpreted). You can also specify the algorithm directly
+32 or 64 bit code, or AArch64 code in Linux (unless compiled with -DNOJIT
+or for another processor, in which case the byte code is interpreted). You can also specify the algorithm directly
 in byte code, although this is less convenient because it requires two
 steps:
 
@@ -834,6 +835,14 @@ Use at your own risk.
 
 #ifndef DEBUG
 #define NDEBUG 1
+#endif
+
+// The JIT emits x86 code, or AArch64 code on Linux: interpret ZPAQL on
+// any other processor or system
+#if !defined(NOJIT) && !defined(__x86_64__) && !defined(__i386__) \
+    && !defined(_M_X64) && !defined(_M_IX86) \
+    && !(defined(__aarch64__) && defined(__linux__))
+#define NOJIT 1
 #endif
 #include <assert.h>
 #include <stdint.h>

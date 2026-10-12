@@ -38,6 +38,17 @@ Run `zpaq` without arguments for a summary of the commands and options.
 - SHA-1 with the x86 SHA extensions, AES with AES-NI (`-key`).
 - Windows: model tables of 4 MiB or more are allocated in large pages when the
   user holds the "Lock pages in memory" privilege.
+- 64-bit ARM (Linux): a JIT compiles ZPAQL and the context model to AArch64
+  code, as the x86 JIT does, with the MIX weights mixed and updated 4 at a
+  time with NEON. SHA-1 and AES use the ARMv8 Crypto Extension, and LZ77
+  filters hash buckets with NEON.
+- Without a JIT (other processors, or `-DNOJIT`), the ZPAQL interpreter keeps
+  the machine registers in locals and dispatches through a table of labels,
+  which makes it about twice as fast.
+- The JIT translated a run of identical swap instructions (ZPAQL `x<>a`) as a
+  single swap. It now follows the specification, like the interpreter. The
+  built-in methods never write such runs, only hand-written configurations
+  can.
 
 All instruction set extensions are detected at run time, with a fallback to
 the original code.
@@ -87,6 +98,36 @@ the two versions taking turns. The times are the best of two rounds; from one
 round to the other they varied by up to 20 %, so the small gains of `-m3` and
 `-m4` are within the noise of a single run.
 
+### Raspberry Pi 5
+
+The same data on a Raspberry Pi 5 (Cortex-A76, 4 cores, 8 GB, Debian 13,
+GCC 14.2, `-O3 -march=native`), 4 threads. Here the fork before the ARM work
+(7.16 as of commit `259662b`, already up to 25 % faster than 7.15 on ARM) is
+compared with the current one, which adds the AArch64 JIT, NEON and the ARMv8
+Crypto Extension.
+
+| Method | Operation | `259662b` | Fork    | Speed-up |
+|--------|-----------|----------:|--------:|---------:|
+| `-m1`  | add       |    9.3 s  |   9.2 s |    ×1.01 |
+|        | extract   |   18.2 s  |   2.0 s |    ×9.33 |
+| `-m2`  | add       |   70.7 s  |  70.5 s |    ×1.00 |
+|        | extract   |   20.0 s  |   2.2 s |    ×9.27 |
+| `-m3`  | add       |   97.0 s  |  87.3 s |    ×1.11 |
+|        | extract   |   74.4 s  |  45.2 s |    ×1.65 |
+| `-m4`  | add       |  257.2 s  | 185.8 s |    ×1.38 |
+|        | extract   |  265.5 s  | 192.1 s |    ×1.38 |
+| `-m5`  | add       |  907.8 s  | 584.2 s |    ×1.55 |
+|        | extract   |  906.2 s  | 587.6 s |    ×1.54 |
+
+Best of two rounds, the two versions taking turns; the rounds agreed within
+6 %. The archives have the same size and each version extracts the archives of
+the other. The Pi was not running at full speed: set to 3.0 GHz with a fan, it
+ran mostly at 2.7 to 2.9 GHz under its soft temperature limit (about 68 °C),
+5 % of the time at 1.5 GHz, and its power supply reported under-voltage. Both
+versions ran under the same conditions, so the ratios hold better than the
+absolute times. Compressing with `-m1` and `-m2` is bound by memory, where the
+ARM code brings nothing.
+
 ## Building
 
 ### Linux
@@ -115,9 +156,11 @@ but its build is about 30 % slower than GCC or Clang on `-m1`.
 
 - The Makefile compiles with `-march=native`, so the executable may not run on
   an older CPU. For a binary to distribute, build with `make CXXFLAGS=-O3`.
-- For non-x86 processors, turn the JIT off: `make CPPFLAGS="-Dunix -DNOJIT"`
-  (keep `-Dunix` on Unix: a `CPPFLAGS` given to make replaces the Makefile's).
-- `-DNOSHANI` and `-DNOAESNI` leave out the SHA and AES-NI code.
+- The JIT is built for x86 and for 64-bit ARM Linux, and left out
+  automatically elsewhere. `make CPPFLAGS="-Dunix -DNOJIT"` leaves it out
+  everywhere (keep `-Dunix` on Unix: a `CPPFLAGS` given to make replaces the
+  Makefile's).
+- `-DNOSHANI` and `-DNOAESNI` leave out the SHA and AES code (x86 and ARM).
 
 [`readme.txt`](readme.txt) is the upstream readme and lists the other compiler
 options.
@@ -125,10 +168,11 @@ options.
 ### Tested platforms
 
 Developed and benchmarked on Windows 11 x64. Linux x86-64 builds and passes
-`make check` (Ubuntu 24.04, GCC 13), and so does Linux ARM64 with `-DNOJIT`
-(Raspberry Pi 5, Debian 13, GCC 14). On ARM most of the speed-ups are absent:
-the JIT, SIMD, SHA and AES-NI code is x86 only, and the fork is at most 25 %
-faster than 7.15 there. macOS, BSD and 32-bit builds have not been tested.
+`make check` (Ubuntu 24.04, GCC 13). Linux ARM64 builds with the JIT and
+passes `make check` with GCC 14 and Clang 19 (Raspberry Pi 5, Debian 13); its
+JIT gives the same compressed data as the interpreter on 1400 random ZPAQL
+configurations. macOS, BSD, Windows on ARM and 32-bit builds have not been
+tested.
 
 ## License
 

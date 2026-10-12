@@ -41,6 +41,11 @@ See libzpaq.h for additional documentation.
 #include <intrin.h>
 #endif
 
+// The JIT emits x86 code, or AArch64 code on 64-bit ARM (see libzpaq.h)
+#if !defined(NOJIT) && defined(__aarch64__)
+#define ZPAQ_JIT_A64 1
+#endif
+
 // Memory prefetch hint (no-op if the compiler does not support it)
 #if defined(__GNUC__) || defined(__clang__)
 #define ZPAQ_PREFETCH(p) __builtin_prefetch(p)
@@ -4280,6 +4285,1179 @@ static int oplen(const U8* hcomp) {
   return 1;
 }
 
+#ifdef ZPAQ_JIT_A64
+
+/////////////////////// AArch64 JIT ///////////////////////
+
+// The same translation as the x86 JIT below, to AArch64 code: ZPAQL to
+// native code in ZPAQL::assemble() and the model of the components to
+// native code in Predictor::assemble_p(). Each instruction is a 32 bit
+// word. An A64 object writes them to code[0..size-1] and counts the ones
+// past the end, so that the caller can allocate the size returned and
+// assemble again. The emitted code follows the AAPCS64 calling convention:
+// the state lives in the callee-saved registers x19..x28.
+
+enum {A64_SP=31, A64_ZR=31, A64_IP0=16, A64_IP1=17};
+enum {A64_EQ=0, A64_NE=1, A64_HS=2, A64_LO=3, A64_HI=8, A64_LS=9,
+      A64_GE=10, A64_LT=11, A64_GT=12, A64_LE=13};
+
+struct A64 {
+  U8* code;  // output
+  int size;  // bytes of code
+  int o;     // output index, a multiple of 4
+
+  A64(U8* c, int n): code(c), size(n), o(0) {}
+
+  void put(U32 x) {
+    if (o+4<=size)
+      code[o]=x, code[o+1]=x>>8, code[o+2]=x>>16, code[o+3]=x>>24;
+    o+=4;
+  }
+  U32 get(int p) const {
+    return code[p]|code[p+1]<<8|code[p+2]<<16|U32(code[p+3])<<24;
+  }
+  void set(int p, U32 x) {
+    if (p+4<=size)
+      code[p]=x, code[p+1]=x>>8, code[p+2]=x>>16, code[p+3]=x>>24;
+  }
+
+  // Registers are 0..31. sf=1 selects the 64 bit form.
+  void addi(int rd, int rn, U32 imm, int sf=0) {  // rd=rn+imm, imm<2^24
+    if (imm>=4096) {
+      put((sf<<31)|0x11400000|((imm>>12)&4095)<<10|rn<<5|rd);
+      imm&=4095;
+      if (!imm) return;
+      rn=rd;
+    }
+    if (imm || rd!=rn) put((sf<<31)|0x11000000|imm<<10|rn<<5|rd);
+  }
+  void subi(int rd, int rn, U32 imm, int sf=0) {  // imm<4096
+    put((sf<<31)|0x51000000|imm<<10|rn<<5|rd);
+  }
+  void cmpi(int rn, U32 imm) {put(0x71000000|imm<<10|rn<<5|31);}  // <4096
+  void cmp(int rn, int rm) {put(0x6B000000|rm<<16|rn<<5|31);}
+  void add(int rd, int rn, int rm, int lsl=0, int sf=0) {
+    put((sf<<31)|0x0B000000|rm<<16|lsl<<10|rn<<5|rd);
+  }
+  void sub(int rd, int rn, int rm) {put(0x4B000000|rm<<16|rn<<5|rd);}
+  void andr(int rd, int rn, int rm) {put(0x0A000000|rm<<16|rn<<5|rd);}
+  void bic(int rd, int rn, int rm) {put(0x0A200000|rm<<16|rn<<5|rd);}
+  void orr(int rd, int rn, int rm) {put(0x2A000000|rm<<16|rn<<5|rd);}
+  void eor(int rd, int rn, int rm) {put(0x4A000000|rm<<16|rn<<5|rd);}
+  void mov(int rd, int rm) {if (rd!=rm) put(0x2A0003E0|rm<<16|rd);}
+  void movx(int rd, int rm) {if (rd!=rm) put(0xAA0003E0|rm<<16|rd);}
+  void mvn(int rd, int rm) {put(0x2A2003E0|rm<<16|rd);}
+  void mul(int rd, int rn, int rm) {put(0x1B007C00|rm<<16|rn<<5|rd);}
+  void madd(int rd, int rn, int rm, int ra) {
+    put(0x1B000000|rm<<16|ra<<10|rn<<5|rd);
+  }
+  void msub(int rd, int rn, int rm, int ra) {
+    put(0x1B008000|rm<<16|ra<<10|rn<<5|rd);
+  }
+  void udiv(int rd, int rn, int rm) {put(0x1AC00800|rm<<16|rn<<5|rd);}
+  void lslv(int rd, int rn, int rm) {put(0x1AC02000|rm<<16|rn<<5|rd);}
+  void lsrv(int rd, int rn, int rm) {put(0x1AC02400|rm<<16|rn<<5|rd);}
+  void lsl(int rd, int rn, int s) {  // 0<s<32
+    put(0x53000000|((32-s)&31)<<16|(31-s)<<10|rn<<5|rd);
+  }
+  void lsr(int rd, int rn, int s) {put(0x53000000|s<<16|31<<10|rn<<5|rd);}
+  void asr(int rd, int rn, int s) {put(0x13000000|s<<16|31<<10|rn<<5|rd);}
+  void ubfx0(int rd, int rn, int k) {  // rd = low k bits of rn, 0<=k<=32
+    if (k<=0) mov(rd, A64_ZR);
+    else put(0x53000000|(k-1)<<10|rn<<5|rd);
+  }
+  void bfxil8(int rd, int rn) {put(0x33000000|7<<10|rn<<5|rd);}  // rd[7:0]
+  void csel(int rd, int rn, int rm, int cond) {
+    put(0x1A800000|rm<<16|cond<<12|rn<<5|rd);
+  }
+  void cset(int rd, int cond) {put(0x1A9F07E0|(cond^1)<<12|rd);}
+  void cinc(int rd, int rn, int cond) {
+    put(0x1A800400|rn<<16|(cond^1)<<12|rn<<5|rd);
+  }
+  void cneg(int rd, int rn, int cond) {
+    put(0x5A800400|rn<<16|(cond^1)<<12|rn<<5|rd);
+  }
+  void movi(int rd, U32 v) {  // 32 bit constant
+    if ((v>>16)==0) put(0x52800000|(v&0xffff)<<5|rd);
+    else if ((v&0xffff)==0) put(0x52A00000|(v>>16)<<5|rd);
+    else if ((~v>>16)==0) put(0x12800000|(~v&0xffff)<<5|rd);
+    else {
+      put(0x52800000|(v&0xffff)<<5|rd);
+      put(0x72A00000|(v>>16)<<5|rd);
+    }
+  }
+  void movx64(int rd, U64 v) {  // 64 bit constant
+    put(0xD2800000|U32(v&0xffff)<<5|rd);
+    for (int k=1; k<4; ++k)
+      if ((v>>(16*k))&0xffff)
+        put(0xF2800000|k<<21|U32((v>>(16*k))&0xffff)<<5|rd);
+  }
+
+  // Load or store rt at [rn+off] with an access of 1<<lg bytes. op is the
+  // unsigned offset form, rop the register offset form of the instruction.
+  void ldst(U32 op, U32 rop, int lg, int rt, int rn, size_t off) {
+    if ((off&((size_t(1)<<lg)-1))==0 && (off>>lg)<4096)
+      put(op|U32(off>>lg)<<10|rn<<5|rt);
+    else {
+      movx64(A64_IP0, off);
+      put(rop|0x6000|A64_IP0<<16|rn<<5|rt);
+    }
+  }
+  void ldrw(int t, int n, size_t d) {ldst(0xB9400000,0xB8600800,2,t,n,d);}
+  void strw(int t, int n, size_t d) {ldst(0xB9000000,0xB8200800,2,t,n,d);}
+  void ldrx(int t, int n, size_t d) {ldst(0xF9400000,0xF8600800,3,t,n,d);}
+  void strx(int t, int n, size_t d) {ldst(0xF9000000,0xF8200800,3,t,n,d);}
+  void ldrb(int t, int n, size_t d) {ldst(0x39400000,0x38600800,0,t,n,d);}
+  void strb(int t, int n, size_t d) {ldst(0x39000000,0x38200800,0,t,n,d);}
+
+  // Load or store rt at [rn+rm<<s], s is 0 or the access size
+  void ldrw_r(int rt, int rn, int rm, bool s) {
+    put(0xB8606800|s<<12|rm<<16|rn<<5|rt);
+  }
+  void strw_r(int rt, int rn, int rm, bool s) {
+    put(0xB8206800|s<<12|rm<<16|rn<<5|rt);
+  }
+  void ldrb_r(int rt, int rn, int rm) {put(0x38606800|rm<<16|rn<<5|rt);}
+  void strb_r(int rt, int rn, int rm) {put(0x38206800|rm<<16|rn<<5|rt);}
+  void ldrh_r(int rt, int rn, int rm, bool s) {
+    put(0x78606800|s<<12|rm<<16|rn<<5|rt);
+  }
+  void ldrsh_r(int rt, int rn, int rm, bool s) {
+    put(0x78E06800|s<<12|rm<<16|rn<<5|rt);
+  }
+  void strh_r(int rt, int rn, int rm, bool s) {
+    put(0x78206800|s<<12|rm<<16|rn<<5|rt);
+  }
+
+  // Branches. A forward branch is emitted with offset 0 and patched later.
+  void b(int target) {put(0x14000000|((target-o)>>2&0x3ffffff));}
+  void bcond(int cond, int target) {
+    put(0x54000000|((target-o)>>2&0x7ffff)<<5|cond);
+  }
+  void cbz(int rt, int target) {
+    put(0x34000000|((target-o)>>2&0x7ffff)<<5|rt);
+  }
+  void cbnz(int rt, int target) {
+    put(0x35000000|((target-o)>>2&0x7ffff)<<5|rt);
+  }
+  void patch(int p, int target) {  // set the target of the branch at p
+    U32 x=get(p);
+    const int d=(target-p)>>2;
+    if ((x&0xfc000000)==0x14000000) x=(x&0xfc000000)|(d&0x3ffffff);
+    else x=(x&0xff00001f)|(d&0x7ffff)<<5;  // b.cond, cbz, cbnz
+    set(p, x);
+  }
+  void blr(int rn) {put(0xD63F0000|rn<<5);}
+  void ret() {put(0xD65F03C0);}
+  void call(const void* f) {movx64(A64_IP0, U64(size_t(f))); blr(A64_IP0);}
+  // rd=(rn&(2^width-1))<<lsb
+  void ubfiz(int rd, int rn, int lsb, int width) {
+    put(0x53000000|((32-lsb)&31)<<16|(width-1)<<10|rn<<5|rd);
+  }
+  void stpzr(int rn) {put(0xA9007C1F|rn<<5);}  // stp xzr, xzr, [xn]
+
+  // NEON on 4 lanes of 32 bits (registers v0..v7, the others are saved
+  // by the callee). The offsets of ldrq and strq are multiples of 16.
+  void ldrq(int vt, int rn, int off) {put(0x3DC00000|(off>>4)<<10|rn<<5|vt);}
+  void strq(int vt, int rn, int off) {put(0x3D800000|(off>>4)<<10|rn<<5|vt);}
+  void movi0(int vd) {put(0x6F00E400|vd);}  // movi vd.2d, #0
+  void dup4s(int vd, int wn) {put(0x4E040C00|wn<<5|vd);}
+  void sshr4s(int vd, int vn, int s) {put(0x4F000400|(64-s)<<16|vn<<5|vd);}
+  void mla4s(int vd, int vn, int vm) {put(0x4EA09400|vm<<16|vn<<5|vd);}
+  void mul4s(int vd, int vn, int vm) {put(0x4EA09C00|vm<<16|vn<<5|vd);}
+  void add4s(int vd, int vn, int vm) {put(0x4EA08400|vm<<16|vn<<5|vd);}
+  void smin4s(int vd, int vn, int vm) {put(0x4EA06C00|vm<<16|vn<<5|vd);}
+  void smax4s(int vd, int vn, int vm) {put(0x4EA06400|vm<<16|vn<<5|vd);}
+  void addv4s(int vd, int vn) {put(0x4EB1B800|vn<<5|vd);}  // sd = sum
+  void fmovws(int wd, int vn) {put(0x1E260000|vn<<5|wd);}  // wd = sn
+
+  // Save x19..x30 in a 96 byte frame, restore them
+  void prologue() {
+    put(0xA9BA7BFD);  // stp x29, x30, [sp, #-96]!
+    put(0x910003FD);  // mov x29, sp
+    put(0xA90153F3);  // stp x19, x20, [sp, #16]
+    put(0xA9025BF5);  // stp x21, x22, [sp, #32]
+    put(0xA90363F7);  // stp x23, x24, [sp, #48]
+    put(0xA9046BF9);  // stp x25, x26, [sp, #64]
+    put(0xA90573FB);  // stp x27, x28, [sp, #80]
+  }
+  void epilogue() {
+    put(0xA94153F3);  // ldp x19, x20, [sp, #16]
+    put(0xA9425BF5);  // ldp x21, x22, [sp, #32]
+    put(0xA94363F7);  // ldp x23, x24, [sp, #48]
+    put(0xA9446BF9);  // ldp x25, x26, [sp, #64]
+    put(0xA94573FB);  // ldp x27, x28, [sp, #80]
+    put(0xA8C67BFD);  // ldp x29, x30, [sp], #96
+    ret();
+  }
+};
+
+// Number of bits of a power of 2
+static int lgsize(size_t n) {
+  int k=0;
+  while ((size_t(1)<<k)<n) ++k;
+  return k;
+}
+
+// Make the instructions just written visible to the instruction fetch
+static void flushCode(U8* p, int n) {
+  __builtin___clear_cache((char*)p, (char*)p+n);
+}
+
+/*
+assemble() translates ZPAQL to AArch64 code: int run(ZPAQL* this). It
+returns 0 after halt, 1 after an invalid instruction or a jump out of the
+code, 2 or 3 if out failed (see flush1()). Registers:
+
+  w19..w22 = a, b, c, d    w23 = f    x27 = this
+  x24 = &m[0]    x25 = &h[0]    x26 = &r[0]
+  w9..w11, x16 = scratch
+
+Jumps are assembled as in the x86 code: each chain of instructions
+reachable from a jump target is translated once, then the branches are
+patched with the address of their target.
+*/
+int ZPAQL::assemble() {
+  const U8* hcomp=&header[hbegin];
+  const int hlen=hend-hbegin+2;
+  const int mbits=lgsize(m.size()), hbits=lgsize(h.size());
+  const int RA=19, RF=23, RM=24, RH=25, RR=26, RT=27;
+  Array<int> it(hlen);  // hcomp -> code locations
+  A64 a64(rcode, rcode_size);
+#define off(x) size_t((char*)&(x)-(char*)this)
+
+  // Branch to the start, filled in last
+  a64.put(0);
+
+  // Code for halt: return w0 after saving the registers
+  const int halt=a64.o;
+  a64.strw(19, RT, off(a));
+  a64.strw(20, RT, off(b));
+  a64.strw(21, RT, off(c));
+  a64.strw(22, RT, off(d));
+  a64.strw(RF, RT, off(f));
+  a64.epilogue();
+
+  // Set it[i]=1 for each ZPAQL instruction reachable from the previous
+  // instruction + 2 if reachable by a jump (or 3 if both).
+  it[0]=2;
+  assert(hlen>0 && hcomp[hlen-1]==0);  // ends with error
+  int done=0;
+  do {
+    done=0;
+    const int NONE=0x80000000;
+    for (int i=0; i<hlen; ++i) {
+      int op=hcomp[i];
+      if (it[i]) {
+        int next1=i+oplen(hcomp+i), next2=NONE; // next and jump targets
+        if (iserr(op)) next1=NONE;  // error
+        if (op==56) next1=NONE, next2=0;  // halt
+        if (op==255) next1=NONE, next2=hcomp[i+1]+256*hcomp[i+2]; // lj
+        if (op==39||op==47||op==63)next2=i+2+(hcomp[i+1]<<24>>24);// jt,jf,jmp
+        if (op==63) next1=NONE;  // jmp
+        if ((next2<0 || next2>=hlen) && next2!=NONE) next2=hlen-1; // error
+        if (next1>=0 && next1<hlen && !(it[next1]&1)) it[next1]|=1, ++done;
+        if (next2>=0 && next2<hlen && !(it[next2]&2)) it[next2]|=2, ++done;
+      }
+    }
+  } while (done>0);
+
+  // Start of run(): save the registers and load the machine state
+  const int start=a64.o;
+  a64.prologue();
+  a64.movx(RT, 0);
+  a64.ldrw(19, RT, off(a));
+  a64.ldrw(20, RT, off(b));
+  a64.ldrw(21, RT, off(c));
+  a64.ldrw(22, RT, off(d));
+  a64.ldrw(RF, RT, off(f));
+  a64.ldrx(RM, RT, off(m));  // Array data pointer is the first member
+  a64.ldrx(RH, RT, off(h));
+  a64.ldrx(RR, RT, off(r));
+
+  // Address of *b, *c in x16 and of *d in x16
+  struct Addr {
+    static void m(A64& a, int reg, int bits) {
+      a.ubfx0(A64_IP0, reg, bits);
+      a.add(A64_IP0, 24, A64_IP0, 0, 1);  // add x16, x24, x16
+    }
+    static void h(A64& a, int bits) {
+      a.ubfx0(A64_IP0, 22, bits);
+      a.add(A64_IP0, 25, A64_IP0, 2, 1);  // add x16, x25, x16, lsl #2
+    }
+  };
+
+  // Assemble in multiple passes until every byte of hcomp has a translation
+  for (int istart=0; istart<hlen; ++istart) {
+    int inc=0;
+    for (int i=istart; i<hlen && it[i]; i+=inc) {
+      const int code=it[i];
+      inc=oplen(hcomp+i);
+
+      // If already assembled, then assemble a jump to it
+      if (code>=16) {
+        if (i>istart) a64.b(code);
+        break;
+      }
+
+      // Else assemble the instruction at hcomp[i]
+      assert(a64.o>=16);
+      it[i]=a64.o;
+      const int op=hcomp[i];
+      const int arg=hcomp[i+1]+((op==255)?256*hcomp[i+2]:0);
+      const int ddd=op/8%8;
+      const int sss=op%8;
+
+      // error instruction: return 1
+      if (iserr(op)) {
+        a64.movi(0, 1);
+        a64.b(halt);
+        continue;
+      }
+
+      // Load the source operand of the assignments and of the operations
+      // on a, giving its register: a..d, else w9
+      int src=9;
+      if (op>=64 && op<240) {
+        if (sss<4) src=RA+sss;
+        else if (sss==4 || sss==5) {
+          a64.ubfx0(9, RA+sss-3, mbits);
+          a64.ldrb_r(9, RM, 9);
+        }
+        else if (sss==6) {
+          a64.ubfx0(9, 22, hbits);
+          a64.ldrw_r(9, RH, 9, true);
+        }
+        else a64.movi(9, arg);
+      }
+
+      if (op<64) {
+        if (ddd<4) {  // ddd = a, b, c, d
+          const int rd=RA+ddd;
+          switch (sss) {
+            case 0: a64.mov(9, RA); a64.mov(RA, rd); a64.mov(rd, 9); break;
+            case 1: a64.addi(rd, rd, inc); break;
+            case 2: a64.subi(rd, rd, inc); break;
+            case 3: a64.mvn(rd, rd); break;
+            case 4: a64.mov(rd, A64_ZR); break;
+            case 7: a64.ldrw(rd, RR, arg*4); break;
+          }
+        }
+        else if (ddd<6) {  // *b, *c
+          if (sss==7) {  // jt, jf: target patched later
+            if (op==39) a64.cbnz(RF, a64.o);
+            else a64.cbz(RF, a64.o);
+          }
+          else {
+            Addr::m(a64, RA+ddd-3, mbits);
+            switch (sss) {
+              case 0:  // swap with the low 8 bits of a
+                a64.ldrb(9, A64_IP0, 0);
+                a64.strb(RA, A64_IP0, 0);
+                a64.bfxil8(RA, 9);
+                break;
+              case 1: case 2: case 3:
+                a64.ldrb(9, A64_IP0, 0);
+                if (sss==1) a64.addi(9, 9, inc);
+                else if (sss==2) a64.subi(9, 9, inc);
+                else a64.mvn(9, 9);
+                a64.strb(9, A64_IP0, 0);
+                break;
+              case 4: a64.strb(A64_ZR, A64_IP0, 0); break;
+            }
+          }
+        }
+        else if (ddd==6) {  // *d
+          if (sss==7) a64.strw(RA, RR, arg*4);  // r=a n
+          else {
+            Addr::h(a64, hbits);
+            switch (sss) {
+              case 0:
+                a64.ldrw(9, A64_IP0, 0);
+                a64.strw(RA, A64_IP0, 0);
+                a64.mov(RA, 9);
+                break;
+              case 1: case 2: case 3:
+                a64.ldrw(9, A64_IP0, 0);
+                if (sss==1) a64.addi(9, 9, inc);
+                else if (sss==2) a64.subi(9, 9, inc);
+                else a64.mvn(9, 9);
+                a64.strw(9, A64_IP0, 0);
+                break;
+              case 4: a64.strw(A64_ZR, A64_IP0, 0); break;
+            }
+          }
+        }
+        else switch (op) {  // special
+          case 56:  // halt
+            a64.mov(0, A64_ZR);
+            a64.b(halt);
+            break;
+          case 57: {  // out: outbuf[bufptr++]=a, flush when full
+            a64.ldrx(10, RT, off(outbuf));
+            a64.ldrw(9, RT, off(bufptr));
+            a64.strb_r(RA, 10, 9);
+            a64.addi(9, 9, 1);
+            a64.strw(9, RT, off(bufptr));
+            a64.movi(10, outbuf.size());
+            a64.cmp(9, 10);
+            const int skip=a64.o;
+            a64.bcond(A64_NE, a64.o);
+            a64.movx(0, RT);
+            a64.call((const void*)&flush1);
+            const int ok=a64.o;
+            a64.cbz(0, a64.o);
+            a64.b(halt);  // w0 = 2 or 3
+            a64.patch(skip, a64.o);
+            a64.patch(ok, a64.o);
+            break;
+          }
+          case 59:  // hash: a = (a + *b + 512) * 773
+            a64.ubfx0(9, 20, mbits);
+            a64.ldrb_r(9, RM, 9);
+            a64.add(RA, RA, 9);
+            a64.addi(RA, RA, 512);
+            a64.movi(10, 773);
+            a64.mul(RA, RA, 10);
+            break;
+          case 60:  // hashd: *d = (*d + a + 512) * 773
+            Addr::h(a64, hbits);
+            a64.ldrw(9, A64_IP0, 0);
+            a64.add(9, 9, RA);
+            a64.addi(9, 9, 512);
+            a64.movi(10, 773);
+            a64.mul(9, 9, 10);
+            a64.strw(9, A64_IP0, 0);
+            break;
+          case 63:  // jmp: target patched later
+            a64.b(a64.o);
+            break;
+        }
+      }
+      else if (op<120) {  // ddd = sss
+        if (ddd<4) a64.mov(RA+ddd, src);
+        else if (ddd<6) {
+          a64.ubfx0(10, RA+ddd-3, mbits);
+          a64.strb_r(src, RM, 10);
+        }
+        else {
+          a64.ubfx0(10, 22, hbits);
+          a64.strw_r(src, RH, 10, true);
+        }
+      }
+      else if (op<240) {  // a op= sss
+        switch (op/8) {
+          case 16: a64.add(RA, RA, src); break;
+          case 17: a64.sub(RA, RA, src); break;
+          case 18: a64.mul(RA, RA, src); break;
+          case 19: a64.udiv(RA, RA, src); break;  // 0 if src is 0
+          case 20:
+            a64.udiv(10, RA, src);
+            a64.msub(10, 10, src, RA);
+            a64.cmpi(src, 0);
+            a64.csel(RA, A64_ZR, 10, A64_EQ);
+            break;
+          case 21: a64.andr(RA, RA, src); break;
+          case 22: a64.bic(RA, RA, src); break;
+          case 23: a64.orr(RA, RA, src); break;
+          case 24: a64.eor(RA, RA, src); break;
+          case 25: a64.lslv(RA, RA, src); break;  // shift count mod 32
+          case 26: a64.lsrv(RA, RA, src); break;
+          case 27: a64.cmp(RA, src); a64.cset(RF, A64_EQ); break;
+          case 28: a64.cmp(RA, src); a64.cset(RF, A64_LO); break;
+          case 29: a64.cmp(RA, src); a64.cset(RF, A64_HI); break;
+        }
+      }
+      else if (op==255)  // lj: target patched later
+        a64.b(a64.o);
+    }
+  }
+
+  // Finish first pass
+  const int rsize=a64.o;
+  if (rsize>rcode_size) return rsize;
+
+  // Fill in jump addresses (second pass)
+  for (int i=0; i<hlen; ++i) {
+    if (it[i]<16) continue;
+    const int op=hcomp[i];
+    if (op==39 || op==47 || op==63 || op==255) {  // jt, jf, jmp, lj
+      int target=hcomp[i+1];
+      if (op==255) target+=hcomp[i+2]*256;  // lj
+      else {
+        if (target>=128) target-=256;
+        target+=i+2;
+      }
+      if (target<0 || target>=hlen) target=hlen-1;  // runtime ZPAQL error
+      a64.patch(it[i], it[target]);
+    }
+  }
+
+  // Branch to start
+  a64.o=0;
+  a64.b(start);
+  flushCode(rcode, rsize);
+#undef off
+  return rsize;
+}
+
+//////////////////////// Predictor::assemble_p() /////////////////////
+
+// Update a MATCH component at the end of a byte, as in update0()
+static void jitMatchByte(Component* cr, U32 hi, int bufbits) {
+  cr->cxt=0;
+  ++cr->limit;
+  cr->limit&=(1<<bufbits)-1;
+  if (cr->a==0) {  // look for a match
+    cr->b=cr->limit-cr->cm(hi);
+    if (cr->b&(cr->ht.size()-1))
+      while (cr->a<255
+             && cr->ht(cr->limit-cr->a-1)==cr->ht(cr->limit-cr->a-cr->b-1))
+        ++cr->a;
+  }
+  else cr->a+=cr->a<255;
+  cr->cm(hi)=cr->limit;
+}
+
+/*
+assemble_p() writes int predict(Predictor*) at pcode[0], void
+update(Predictor*, int y) at pcode[4] and int updatePredict(Predictor*,
+int y) at pcode[8], which falls into predict() after update() except at
+a byte boundary, where it returns -1. Registers:
+
+  x19 = this    w20 = y    x21 = &comp[i]
+  x22 = &stretcht[0]    x23 = &squasht[0]    x24 = &dt[0]
+  x25 = &dt2k[0]    x26 = &st.ns[0]    w27 = hmap4&15
+  w28 = 1 at the first bit of a nibble (predict()), or 1 if entered as
+        updatePredict (update())
+  w0..w15, x16, v0..v7 = scratch (also clobbered by calls)
+*/
+int Predictor::assemble_p() {
+  Predictor& pr=*this;
+  A64 a(pr.pcode, pcode_size);
+  U8* hcomp=&pr.z.header[0];
+  const int n=hcomp[6];  // number of components
+  const int RP=19, RY=20, RC=21, RS=22, RQ=23, RDT=24, RD2=25, RST=26;
+  const int RH4=27, RFL=28;
+#define off(x)  size_t((char*)&(pr.x)-(char*)&pr)
+#define offc(x) size_t((char*)&(pr.comp[0].x)-(char*)&pr.comp[0])
+
+  a.put(0);  // b predict
+  a.put(0);  // b update
+  a.put(0);  // b updatePredict
+
+  // Common entry: save registers, set the table pointers
+  struct Entry {
+    static void put(A64& a, Predictor& pr) {
+      a.prologue();
+      a.movx(19, 0);
+      a.addi(22, 19, U32(off(stretcht[0])), 1);
+      a.addi(23, 19, U32(off(squasht[0])), 1);
+      a.addi(24, 19, U32(off(dt[0])), 1);
+      a.addi(25, 19, U32(off(dt2k[0])), 1);
+      a.addi(26, 19, U32(off(st.ns[0])), 1);
+    }
+  };
+
+  // Clamp w to -2048..2047, uses w15
+  struct Clamp {
+    static void k2(A64& a, int w) {
+      a.movi(15, 2047);
+      a.cmp(w, 15);
+      a.csel(w, w, 15, A64_LE);
+      a.movi(15, U32(-2048));
+      a.cmp(w, 15);
+      a.csel(w, w, 15, A64_GE);
+    }
+    static void k512(A64& a, int w) {  // -2^19..2^19-1
+      a.movi(15, (1<<19)-1);
+      a.cmp(w, 15);
+      a.csel(w, w, 15, A64_LE);
+      a.movi(15, U32(-(1<<19)));
+      a.cmp(w, 15);
+      a.csel(w, w, 15, A64_GE);
+    }
+  };
+
+  // y*32767-squash(p[i]) in w, uses w15
+  struct Err {
+    static void put(A64& a, Predictor& pr, int w, int i) {
+      a.ldrw(w, 19, off(p[i]));
+      a.addi(w, w, 2048);
+      a.ldrh_r(w, 23, w, true);
+      a.lsl(15, 20, 15);
+      a.sub(15, 15, 20);
+      a.sub(w, 15, w);
+    }
+  };
+
+  //////////// predict()
+  const int predict_entry=a.o;
+  Entry::put(a, pr);
+  const int predict_body=a.o;
+  a.ldrw(0, RP, off(c8));  // w28 = c8==1 || (c8&0xf0)==16
+  a.cmpi(0, 1);
+  a.cset(RFL, A64_EQ);
+  a.lsr(1, 0, 4);
+  a.cmpi(1, 1);
+  a.cset(1, A64_EQ);
+  a.orr(RFL, RFL, 1);
+  a.ldrw(RH4, RP, off(hmap4));
+  a.ubfx0(RH4, RH4, 4);
+  U8* cp=hcomp+7;
+  for (int i=0; i<n; ++i, cp+=compsize[cp[0]]) {
+    if (cp-hcomp>=pr.z.cend) error("comp too big");
+    if (cp[0]<1 || cp[0]>9) error("invalid component");
+    a.addi(RC, RP, U32(off(comp[i])), 1);
+    switch (cp[0]) {
+      case CONS:  // c
+        break;
+
+      case CM:  // sizebits limit
+        // cr.cxt=h[i]^hmap4;
+        // p[i]=stretch(cr.cm(cr.cxt)>>17);
+        a.ldrw(0, RP, off(h[i]));
+        a.ldrw(1, RP, off(hmap4));
+        a.eor(0, 0, 1);
+        a.ubfx0(0, 0, cp[1]);
+        a.strx(0, RC, offc(cxt));
+        a.ldrx(1, RC, offc(cm));
+        a.ldrw_r(0, 1, 0, true);
+        a.lsr(0, 0, 17);
+        a.ldrsh_r(0, RS, 0, true);
+        a.strw(0, RP, off(p[i]));
+        break;
+
+      case ICM:  // sizebits
+      case ISSE: {  // sizebits j -- c=hi, cxt=bh
+        // if (c8==1 || (c8&0xf0)==16) cr.c=find(cr.ht, cp[1]+2, h[i]+16*c8);
+        // cr.cxt=cr.ht[cr.c+(hmap4&15)];
+        a.ldrx(2, RC, offc(ht));
+        const int lnofind=a.o;
+        a.cbz(RFL, a.o);
+        {
+          // find(): chk=cxt>>sizebits&255, rows h0, h0^16, h0^32 of 16
+          // bytes where h0=(cxt*16)&(ht.size()-16). Return the row whose
+          // first byte is chk, else clear the row with the lowest
+          // priority (second byte) and put chk in it.
+          const int sizebits=cp[1]+2;
+          a.ldrw(0, RP, off(c8));
+          a.ldrw(1, RP, off(h[i]));
+          a.add(1, 1, 0, 4);         // cxt=h[i]+16*c8
+          a.lsr(3, 1, sizebits);
+          a.ubfx0(3, 3, 8);          // chk
+          a.ubfiz(4, 1, 4, sizebits);  // h0
+          a.movi(7, 16);
+          a.eor(5, 4, 7);            // h1
+          a.movi(7, 32);
+          a.eor(6, 4, 7);            // h2
+          a.ldrb_r(8, 2, 4);
+          a.cmp(8, 3);
+          const int f0=a.o;
+          a.bcond(A64_EQ, a.o);
+          a.ldrb_r(8, 2, 5);
+          a.cmp(8, 3);
+          const int f1=a.o;
+          a.bcond(A64_EQ, a.o);
+          a.ldrb_r(8, 2, 6);
+          a.cmp(8, 3);
+          const int f2=a.o;
+          a.bcond(A64_EQ, a.o);
+          // no match: priorities ht[h0+1], ht[h1+1], ht[h2+1]
+          a.add(9, 2, 4, 0, 1);
+          a.ldrb(10, 9, 1);
+          a.add(9, 2, 5, 0, 1);
+          a.ldrb(11, 9, 1);
+          a.add(9, 2, 6, 0, 1);
+          a.ldrb(12, 9, 1);
+          // h=h0 if p0<=p1 && p0<=p2, else h1 if p1<p2, else h2
+          a.cmp(11, 12);
+          a.csel(13, 5, 6, A64_LO);  // h1 or h2
+          a.cmp(10, 11);
+          a.csel(14, 4, 13, A64_LS);
+          a.cmp(10, 12);
+          a.csel(4, 14, 13, A64_LS);  // h0 needs p0<=p1 and p0<=p2
+          a.add(9, 2, 4, 0, 1);
+          a.stpzr(9);
+          a.strb(3, 9, 0);
+          const int fend=a.o;      // replaced row in w4
+          a.b(a.o);
+          a.patch(f1, a.o);        // found at h1
+          a.mov(4, 5);
+          const int f1end=a.o;
+          a.b(a.o);
+          a.patch(f2, a.o);        // found at h2
+          a.mov(4, 6);
+          a.patch(f0, a.o);        // found at h0, already in w4
+          a.patch(fend, a.o);
+          a.patch(f1end, a.o);
+          a.strx(4, RC, offc(c));
+          a.mov(0, 4);
+          const int lfound=a.o;
+          a.b(a.o);
+          a.patch(lnofind, a.o);
+          a.ldrw(0, RC, offc(c));
+          a.patch(lfound, a.o);
+        }
+        a.add(0, 0, RH4);
+        a.ldrb_r(1, 2, 0);  // bit history
+        a.strx(1, RC, offc(cxt));
+        a.ldrx(3, RC, offc(cm));
+        if (cp[0]==ICM) {
+          // p[i]=stretch(cr.cm(cr.cxt)>>8);
+          a.ldrw_r(0, 3, 1, true);
+          a.lsr(0, 0, 8);
+          a.ldrsh_r(0, RS, 0, true);
+        }
+        else {
+          // int *wt=(int*)&cr.cm[cr.cxt*2];
+          // p[i]=clamp2k((wt[0]*p[cp[2]]+wt[1]*64)>>16);
+          a.add(3, 3, 1, 3, 1);  // add x3, x3, x1, lsl #3
+          a.ldrw(4, 3, 0);
+          a.ldrw(5, 3, 4);
+          a.ldrw(0, RP, off(p[cp[2]]));
+          a.mul(0, 0, 4);
+          a.add(0, 0, 5, 6);
+          a.asr(0, 0, 16);
+          Clamp::k2(a, 0);
+        }
+        a.strw(0, RP, off(p[i]));
+        break;
+      }
+
+      case MATCH: {  // sizebits bufbits: a=len, b=offset, c=bit, cxt=bitpos,
+                     //                   ht=buf, limit=pos
+        // if (cr.a==0) p[i]=0;
+        // else {
+        //   cr.c=(cr.ht(cr.limit-cr.b)>>(7-cr.cxt))&1; // predicted bit
+        //   p[i]=stretch(dt2k[cr.a]*(cr.c*-2+1)&32767);
+        // }
+        a.ldrw(0, RC, offc(a));
+        const int lz=a.o;
+        a.cbz(0, a.o);
+        a.ldrx(2, RC, offc(ht));
+        a.ldrw(1, RC, offc(limit));
+        a.ldrw(3, RC, offc(b));
+        a.sub(1, 1, 3);
+        a.ubfx0(1, 1, cp[2]);
+        a.ldrb_r(1, 2, 1);
+        a.ldrw(3, RC, offc(cxt));
+        a.movi(4, 7);
+        a.sub(4, 4, 3);
+        a.lsrv(1, 1, 4);
+        a.ubfx0(1, 1, 1);
+        a.strx(1, RC, offc(c));
+        a.ldrw_r(0, RD2, 0, true);  // dt2k[a]
+        a.cmpi(1, 0);
+        a.cneg(0, 0, A64_NE);
+        a.ubfx0(0, 0, 15);
+        a.ldrsh_r(0, RS, 0, true);
+        a.patch(lz, a.o);  // w0 = 0 if a==0
+        a.strw(0, RP, off(p[i]));
+        break;
+      }
+
+      case AVG:  // j k wt
+        // p[i]=(p[cp[1]]*cp[3]+p[cp[2]]*(256-cp[3]))>>8;
+        a.ldrw(0, RP, off(p[cp[1]]));
+        a.ldrw(1, RP, off(p[cp[2]]));
+        a.movi(2, cp[3]);
+        a.mul(0, 0, 2);
+        a.movi(2, 256-cp[3]);
+        a.madd(0, 1, 2, 0);
+        a.asr(0, 0, 8);
+        a.strw(0, RP, off(p[i]));
+        break;
+
+      case MIX2:   // sizebits j k rate mask
+        // cr.cxt=((h[i]+(c8&cp[5]))&(cr.c-1));
+        // int w=cr.a16[cr.cxt];
+        // p[i]=(w*p[cp[2]]+(65536-w)*p[cp[3]])>>16;
+        a.ldrw(0, RP, off(c8));
+        a.movi(1, cp[5]);
+        a.andr(0, 0, 1);
+        a.ldrw(1, RP, off(h[i]));
+        a.add(0, 0, 1);
+        a.ubfx0(0, 0, cp[1]);
+        a.strx(0, RC, offc(cxt));
+        a.ldrx(2, RC, offc(a16));
+        a.ldrh_r(3, 2, 0, true);
+        a.ldrw(4, RP, off(p[cp[2]]));
+        a.ldrw(5, RP, off(p[cp[3]]));
+        a.mul(4, 4, 3);
+        a.movi(6, 65536);
+        a.sub(6, 6, 3);
+        a.madd(4, 5, 6, 4);
+        a.asr(4, 4, 16);
+        a.strw(4, RP, off(p[i]));
+        break;
+
+      case MIX: {  // sizebits j m rate mask
+        // cr.cxt=h[i]+(c8&cp[5]);
+        // cr.cxt=(cr.cxt&(cr.c-1))*m; // pointer to row of weights
+        // int* wt=(int*)&cr.cm[cr.cxt];
+        // p[i]=clamp2k(sum((wt[j]>>8)*p[cp[2]+j])>>8);
+        const int m=cp[3];
+        a.ldrw(0, RP, off(c8));
+        a.movi(1, cp[5]);
+        a.andr(0, 0, 1);
+        a.ldrw(1, RP, off(h[i]));
+        a.add(0, 0, 1);
+        a.ubfx0(0, 0, cp[1]);
+        a.movi(1, m);
+        a.mul(0, 0, 1);
+        a.strx(0, RC, offc(cxt));
+        a.ldrx(1, RC, offc(cm));
+        a.add(0, 1, 0, 2, 1);  // x0 = wt
+        a.addi(1, RP, U32(off(p[cp[2]])), 1);  // x1 = inputs
+        // 4 weights at a time in v0 and v1 alternately, then the rest
+        a.movi0(0);
+        a.movi0(1);
+        int k=0;
+        for (; k+4<=m; k+=4) {
+          a.ldrq(2, 0, k*4);
+          a.ldrq(3, 1, k*4);
+          a.sshr4s(2, 2, 8);
+          a.mla4s(k&4 ? 1 : 0, 2, 3);
+        }
+        a.add4s(0, 0, 1);
+        a.addv4s(0, 0);
+        a.fmovws(2, 0);
+        for (; k<m; ++k) {
+          a.ldrw(3, 0, k*4);
+          a.asr(3, 3, 8);
+          a.ldrw(4, 1, k*4);
+          a.madd(2, 3, 4, 2);
+        }
+        a.asr(2, 2, 8);
+        Clamp::k2(a, 2);
+        a.strw(2, RP, off(p[i]));
+        break;
+      }
+
+      case SSE:  // sizebits j start limit
+        // cr.cxt=(h[i]+c8)*32;
+        // int pq=p[cp[2]]+992;
+        // if (pq<0) pq=0;
+        // if (pq>1983) pq=1983;
+        // int wt=pq&63;
+        // pq>>=6;
+        // cr.cxt+=pq;
+        // p[i]=stretch(((cr.cm(cr.cxt)>>10)*(64-wt)
+        //               +(cr.cm(cr.cxt+1)>>10)*wt)>>13);
+        // cr.cxt+=wt>>5;
+        a.ldrw(0, RP, off(h[i]));
+        a.ldrw(1, RP, off(c8));
+        a.add(0, 0, 1);
+        a.ubfx0(0, 0, cp[1]);
+        a.lsl(0, 0, 5);
+        a.ldrw(1, RP, off(p[cp[2]]));
+        a.addi(1, 1, 992);
+        a.cmpi(1, 0);
+        a.csel(1, 1, A64_ZR, A64_GE);
+        a.movi(2, 1983);
+        a.cmp(1, 2);
+        a.csel(1, 1, 2, A64_LE);
+        a.ubfx0(2, 1, 6);  // wt
+        a.lsr(1, 1, 6);
+        a.add(0, 0, 1);
+        a.ldrx(3, RC, offc(cm));
+        a.add(3, 3, 0, 2, 1);  // x3 = &cm[cxt]
+        a.ldrw(4, 3, 0);
+        a.ldrw(5, 3, 4);
+        a.cmpi(2, 32);
+        a.cinc(0, 0, A64_HS);
+        a.strx(0, RC, offc(cxt));
+        a.lsr(4, 4, 10);
+        a.lsr(5, 5, 10);
+        a.movi(6, 64);
+        a.sub(6, 6, 2);
+        a.mul(4, 4, 6);
+        a.madd(4, 5, 2, 4);
+        a.lsr(4, 4, 13);
+        a.ldrsh_r(4, RS, 4, true);
+        a.strw(4, RP, off(p[i]));
+        break;
+
+      default:
+        error("invalid ZPAQ component");
+    }
+  }
+
+  // return squash(p[n-1])
+  a.ldrw(0, RP, off(p[n-1]));
+  a.addi(0, 0, 2048);
+  a.ldrh_r(0, RQ, 0, true);
+  const int epi=a.o;
+  a.epilogue();
+
+  //////////// update() and updatePredict()
+  const int update_entry=a.o;
+  Entry::put(a, pr);
+  a.mov(RY, 1);
+  a.mov(RFL, A64_ZR);
+  const int update_body=a.o;
+  a.ldrw(RH4, RP, off(hmap4));
+  a.ubfx0(RH4, RH4, 4);
+  cp=hcomp+7;
+  for (int i=0; i<n; ++i, cp+=compsize[cp[0]]) {
+    a.addi(RC, RP, U32(off(comp[i])), 1);
+    switch (cp[0]) {
+      case CONS:  // c
+      case AVG:   // j k wt
+        break;
+
+      case SSE:  // sizebits j start limit
+      case CM:   // sizebits limit
+        // U32& pn=cr.cm(cr.cxt);
+        // U32 count=pn&0x3ff;
+        // int error=y*32767-(cr.cm(cr.cxt)>>17);
+        // pn+=(error*dt[count]&-1024)+(count<cr.limit);
+        a.ldrx(3, RC, offc(cm));
+        a.ldrw(0, RC, offc(cxt));
+        a.ubfx0(0, 0, lgsize(pr.comp[i].cm.size()));
+        a.add(3, 3, 0, 2, 1);  // x3 = &pn
+        a.ldrw(1, 3, 0);
+        a.ubfx0(2, 1, 10);  // count
+        a.lsr(4, 1, 17);
+        a.lsl(5, RY, 15);
+        a.sub(5, 5, RY);
+        a.sub(5, 5, 4);  // error
+        a.ldrw_r(6, RDT, 2, true);
+        a.mul(5, 5, 6);
+        a.asr(5, 5, 10);
+        a.lsl(5, 5, 10);
+        a.cmpi(2, U32(pr.comp[i].limit));
+        a.cinc(5, 5, A64_LO);
+        a.add(1, 1, 5);
+        a.strw(1, 3, 0);
+        break;
+
+      case ICM:   // sizebits: cxt=bh, ht[c][0..15]=bh row
+      case ISSE: {  // sizebits j  -- c=hi, cxt=bh
+        // cr.ht[cr.c+(hmap4&15)]=st.next(cr.ht[cr.c+(hmap4&15)], y);
+        a.ldrw(0, RC, offc(c));
+        a.add(0, 0, RH4);
+        a.ldrx(2, RC, offc(ht));
+        a.ldrb_r(1, 2, 0);  // bh
+        a.add(3, RY, 1, 2);  // y+bh*4
+        a.ldrb_r(3, RST, 3);
+        a.strb_r(3, 2, 0);
+        a.ldrw(1, RC, offc(cxt));
+        a.ldrx(4, RC, offc(cm));
+        if (cp[0]==ICM) {
+          // U32& pn=cr.cm(cr.cxt);
+          // pn+=int(y*32767-(pn>>8))>>2;
+          a.ubfx0(1, 1, 8);
+          a.add(4, 4, 1, 2, 1);  // x4 = &pn
+          a.ldrw(5, 4, 0);
+          a.lsr(6, 5, 8);
+          a.lsl(7, RY, 15);
+          a.sub(7, 7, RY);
+          a.sub(7, 7, 6);
+          a.asr(7, 7, 2);
+          a.add(5, 5, 7);
+          a.strw(5, 4, 0);
+        }
+        else {
+          // int err=y*32767-squash(p[i]);
+          // int *wt=(int*)&cr.cm[cr.cxt*2];
+          // wt[0]=clamp512k(wt[0]+((err*p[cp[2]]+(1<<12))>>13));
+          // wt[1]=clamp512k(wt[1]+((err+16)>>5));
+          Err::put(a, pr, 6, i);
+          a.add(4, 4, 1, 3, 1);  // x4 = wt
+          a.ldrw(5, RP, off(p[cp[2]]));
+          a.mul(5, 5, 6);
+          a.addi(5, 5, 1<<12);
+          a.asr(5, 5, 13);
+          a.ldrw(7, 4, 0);
+          a.add(5, 5, 7);
+          Clamp::k512(a, 5);
+          a.strw(5, 4, 0);
+          a.addi(6, 6, 16);
+          a.asr(6, 6, 5);
+          a.ldrw(7, 4, 4);
+          a.add(6, 6, 7);
+          Clamp::k512(a, 6);
+          a.strw(6, 4, 4);
+        }
+        break;
+      }
+
+      case MATCH: {  // sizebits bufbits:
+                     //   a=len, b=offset, c=bit, cm=index, cxt=bitpos
+                     //   ht=buf, limit=pos
+        // if (int(cr.c)!=y) cr.a=0;  // mismatch?
+        // cr.ht(cr.limit)+=cr.ht(cr.limit)+y;
+        // if (++cr.cxt==8) jitMatchByte();
+        a.ldrw(0, RC, offc(c));
+        a.ldrw(1, RC, offc(a));
+        a.cmp(0, RY);
+        a.csel(1, 1, A64_ZR, A64_EQ);
+        a.strx(1, RC, offc(a));
+        a.ldrx(2, RC, offc(ht));
+        a.ldrw(3, RC, offc(limit));
+        a.ubfx0(3, 3, cp[2]);
+        a.ldrb_r(4, 2, 3);
+        a.add(4, RY, 4, 1);
+        a.strb_r(4, 2, 3);
+        a.ldrw(5, RC, offc(cxt));
+        a.addi(5, 5, 1);
+        a.strx(5, RC, offc(cxt));
+        a.cmpi(5, 8);
+        const int lnb=a.o;
+        a.bcond(A64_NE, a.o);
+        a.movx(0, RC);
+        a.ldrw(1, RP, off(h[i]));
+        a.movi(2, cp[2]);
+        a.call((const void*)&jitMatchByte);
+        a.patch(lnb, a.o);
+        break;
+      }
+
+      case MIX2: { // sizebits j k rate mask
+        // int err=(y*32767-squash(p[i]))*cp[4]>>5;
+        // int w=cr.a16[cr.cxt];
+        // w+=(err*(p[cp[2]]-p[cp[3]])+(1<<12))>>13;
+        // if (w<0) w=0;
+        // if (w>65535) w=65535;
+        // cr.a16[cr.cxt]=w;
+        Err::put(a, pr, 0, i);
+        a.movi(1, cp[4]);
+        a.mul(0, 0, 1);
+        a.asr(0, 0, 5);
+        a.ldrw(1, RP, off(p[cp[2]]));
+        a.ldrw(2, RP, off(p[cp[3]]));
+        a.sub(1, 1, 2);
+        a.mul(0, 0, 1);
+        a.addi(0, 0, 1<<12);
+        a.asr(0, 0, 13);
+        a.ldrw(3, RC, offc(cxt));
+        a.ldrx(4, RC, offc(a16));
+        a.ldrh_r(5, 4, 3, true);
+        a.add(0, 0, 5);
+        a.cmpi(0, 0);
+        a.csel(0, 0, A64_ZR, A64_GE);
+        a.movi(5, 65535);
+        a.cmp(0, 5);
+        a.csel(0, 0, 5, A64_LE);
+        a.strh_r(0, 4, 3, true);
+        break;
+      }
+
+      case MIX: {  // sizebits j m rate mask
+        // int err=(y*32767-squash(p[i]))*cp[4]>>4;
+        // int* wt=(int*)&cr.cm[cr.cxt];
+        // for (int j=0; j<m; ++j)
+        //   wt[j]=clamp512k(wt[j]+((err*p[cp[2]+j]+(1<<12))>>13));
+        const int m=cp[3];
+        Err::put(a, pr, 3, i);
+        a.movi(1, cp[4]);
+        a.mul(3, 3, 1);
+        a.asr(3, 3, 4);  // err
+        a.ldrx(0, RC, offc(cm));
+        a.ldrw(1, RC, offc(cxt));
+        a.add(0, 0, 1, 2, 1);  // x0 = wt
+        a.addi(1, RP, U32(off(p[cp[2]])), 1);  // x1 = inputs
+        // 4 weights at a time: v4 = err, v5 = 4096, v6, v7 = bounds
+        int k=0;
+        if (m>=4) {
+          a.dup4s(4, 3);
+          a.movi(2, 1<<12);
+          a.dup4s(5, 2);
+          a.movi(2, (1<<19)-1);
+          a.dup4s(6, 2);
+          a.movi(2, U32(-(1<<19)));
+          a.dup4s(7, 2);
+          for (; k+4<=m; k+=4) {
+            a.ldrq(0, 1, k*4);
+            a.mul4s(0, 0, 4);
+            a.add4s(0, 0, 5);
+            a.sshr4s(0, 0, 13);
+            a.ldrq(1, 0, k*4);
+            a.add4s(1, 1, 0);
+            a.smin4s(1, 1, 6);
+            a.smax4s(1, 1, 7);
+            a.strq(1, 0, k*4);
+          }
+        }
+        for (; k<m; ++k) {
+          a.ldrw(2, 1, k*4);
+          a.mul(2, 2, 3);
+          a.addi(2, 2, 1<<12);
+          a.asr(2, 2, 13);
+          a.ldrw(4, 0, k*4);
+          a.add(2, 2, 4);
+          Clamp::k512(a, 2);
+          a.strw(2, 0, k*4);
+        }
+        break;
+      }
+
+      default:
+        error("invalid ZPAQ component");
+    }
+  }
+
+  // If entered through updatePredict(), save the bit in c8 and hmap4 as
+  // Predictor::update() does, then fall into predict(). A byte boundary
+  // needs z.run() and the context hashes, which stay in C++: return -1.
+  const int lret=a.o;
+  a.cbz(RFL, a.o);
+  a.ldrw(0, RP, off(c8));
+  a.add(0, RY, 0, 1);  // c8*2+y
+  a.strw(0, RP, off(c8));
+  a.cmpi(0, 256);
+  const int lbound=a.o;
+  a.bcond(A64_HS, a.o);
+  a.ldrw(1, RP, off(hmap4));
+  a.subi(2, 0, 16);
+  a.cmpi(2, 16);
+  const int lelse=a.o;
+  a.bcond(A64_HS, a.o);  // c8 not in 16..31
+  a.ubfx0(1, 1, 4);      // hmap4=(hmap4&0xf)<<5|y<<4|1
+  a.lsl(1, 1, 5);
+  a.add(1, 1, RY, 4);
+  a.addi(1, 1, 1);
+  a.strw(1, RP, off(hmap4));
+  a.b(predict_body);
+  a.patch(lelse, a.o);   // hmap4=(hmap4&0x1f0)|(((hmap4&0xf)*2+y)&0xf)
+  a.ubfx0(2, 1, 4);
+  a.add(2, RY, 2, 1);
+  a.ubfx0(2, 2, 4);
+  a.lsr(1, 1, 4);
+  a.ubfx0(1, 1, 5);
+  a.lsl(1, 1, 4);
+  a.orr(1, 1, 2);
+  a.strw(1, RP, off(hmap4));
+  a.b(predict_body);
+  a.patch(lbound, a.o);
+  a.movi(0, U32(-1));
+  a.patch(lret, a.o);
+  a.b(epi);
+
+  // Entry of updatePredict()
+  const int fused_entry=a.o;
+  Entry::put(a, pr);
+  a.mov(RY, 1);
+  a.movi(RFL, 1);
+  a.b(update_body);
+
+  // Branches at the start
+  const int rsize=a.o;
+  a.o=0;
+  a.b(predict_entry);
+  a.b(update_entry);
+  a.b(fused_entry);
+  pr.upofs=8;
+  if (rsize<=pcode_size) flushCode(pr.pcode, rsize);
+#undef off
+#undef offc
+  return rsize;
+}
+
+#else  // x86
+
 // Write k bytes of x to rcode[o++] MSB first
 static void put(U8* rcode, int n, int& o, U32 x, int k) {
   while (k-->0) {
@@ -5884,6 +7062,7 @@ int Predictor::assemble_p() {
   return o;
 }
 
+#endif // ZPAQ_JIT_A64
 #endif // ifndef NOJIT
 
 // Return a prediction of the next bit in range 0..32767
@@ -5903,7 +7082,11 @@ int Predictor::predict() {
       error("run JIT failed");
   }
   assert(pcode && pcode[0]);
+#ifdef ZPAQ_JIT_A64
+  return ((int(*)(Predictor*))&pcode[0])(this);
+#else
   return ((int(*)(Predictor*))&pcode[10])(this);
+#endif
 #endif
 }
 
@@ -5913,7 +7096,11 @@ void Predictor::update(int y) {
 #ifdef NOJIT
   update0(y);
 #else
+#ifdef ZPAQ_JIT_A64
+  assert(pcode && pcode[4]);
+#else
   assert(pcode && pcode[5]);
+#endif
 
   // Prefetch the rows of the next bit before the model is updated, so
   // that the memory latency overlaps the update and the next predict.
@@ -5922,7 +7109,11 @@ void Predictor::update(int y) {
     prefetchNext(c8n, c8n>=16 && c8n<32 ? (hmap4&0xf)<<5|y<<4|1
                  : (hmap4&0x1f0)|(((hmap4&0xf)*2+y)&0xf));
   }
+#ifdef ZPAQ_JIT_A64
+  ((void(*)(Predictor*, int))&pcode[4])(this, y);
+#else
   ((void(*)(Predictor*, int))&pcode[5])(this, y);
+#endif
 
   // Save bit y in c8, hmap4 (not implemented in JIT)
   c8+=c8+y;
@@ -5992,7 +7183,11 @@ void ZPAQL::run(U32 input) {
       error("run JIT failed");
   }
   a=input;
+#ifdef ZPAQ_JIT_A64
+  const U32 rc=((int(*)(ZPAQL*))(&rcode[0]))(this);
+#else
   const U32 rc=((int(*)())(&rcode[0]))();
+#endif
   if (rc==0) return;
   else if (rc==1) libzpaq::error("Bad ZPAQL opcode");
   else if (rc==2) libzpaq::error("Out of memory");

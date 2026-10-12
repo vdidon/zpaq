@@ -39,7 +39,8 @@ For BSD or OS/X
 Possible options:
 
   -DDEBUG    Enable run time checks and help screen for undocumented options.
-  -DNOJIT    Don't assume x86 with SSE2 for libzpaq. Slower (disables JIT).
+  -DNOJIT    Don't assume x86 with SSE2 or AArch64 Linux for libzpaq.
+             Slower (disables JIT). Automatic on other processors.
   -Dunix     Not Windows. Sometimes automatic in Linux. Needed for Mac OS/X.
   -DBSD      For BSD or OS/X.
   -DPTHREAD  Use Pthreads instead of Windows threads. Requires pthreadGC2.dll
